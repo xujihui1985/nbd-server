@@ -87,6 +87,13 @@ pub struct CompactResponse {
     pub garbage_collected_objects: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ResetCacheResponse {
+    pub discarded_dirty_chunks: usize,
+    pub discarded_resident_chunks: usize,
+    pub manifest_generation: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CurrentRef {
     generation: u64,
@@ -185,7 +192,7 @@ impl Export {
             )?
         };
         Self::recover_local_state(&config.cache_dir, &cache)?;
-        cache.set_manifest_generation(manifest.generation)?;
+        cache.rebind_manifest_generation(manifest.generation)?;
         cache.set_clean_shutdown(false)?;
 
         let chunk_total = cache.chunk_count();
@@ -303,6 +310,13 @@ impl Export {
         result
     }
 
+    pub async fn reset_cache(&self) -> Result<ResetCacheResponse> {
+        self.begin_operation("reset-cache")?;
+        let result = self.reset_cache_inner().await;
+        self.end_operation();
+        result
+    }
+
     pub async fn status(&self) -> Status {
         let remote_head = self.remote_head.read().await;
         let operation_state = self
@@ -393,6 +407,16 @@ impl Export {
         Ok(CompactResponse {
             generation: result.generation,
             garbage_collected_objects: result.garbage_collected_objects,
+        })
+    }
+
+    async fn reset_cache_inner(&self) -> Result<ResetCacheResponse> {
+        let _reset_guard = self.write_gate.write().await;
+        let (discarded_dirty_chunks, discarded_resident_chunks) = self.cache.reset_local_state()?;
+        Ok(ResetCacheResponse {
+            discarded_dirty_chunks,
+            discarded_resident_chunks,
+            manifest_generation: self.cache.manifest_generation(),
         })
     }
 
@@ -1027,6 +1051,235 @@ mod tests {
         let status = export.status().await;
         assert_eq!(status.remote_head_generation, 1);
         assert_eq!(export.read(0, 8).await.unwrap(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn reopening_same_cache_dir_on_new_snapshot_invalidates_clean_resident_chunks() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-1.blob",
+                Bytes::from_static(b"abcdefgh"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-2.blob",
+                Bytes::from_static(b"wxyz1234"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/1/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":1,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-1.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/2/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":2,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-2.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut first_config = base_config(dir.path());
+        first_config.snapshot_id = Some(1);
+        let first = Export::open(first_config, remote.clone()).await.unwrap();
+        assert_eq!(first.read(0, 8).await.unwrap(), b"abcdefgh");
+        first.shutdown().unwrap();
+        drop(first);
+
+        let mut second_config = base_config(dir.path());
+        second_config.snapshot_id = Some(2);
+        let second = Export::open(second_config, remote).await.unwrap();
+        assert_eq!(second.read(0, 8).await.unwrap(), b"wxyz1234");
+    }
+
+    #[tokio::test]
+    async fn opening_different_snapshot_with_dirty_local_cache_is_rejected() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-1.blob",
+                Bytes::from_static(b"abcdefgh"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-2.blob",
+                Bytes::from_static(b"wxyz1234"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/1/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":1,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-1.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/2/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":2,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-2.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut first_config = base_config(dir.path());
+        first_config.snapshot_id = Some(1);
+        let first = Export::open(first_config, remote.clone()).await.unwrap();
+        first.write(0, b"ZZZZ", false).await.unwrap();
+        first.shutdown().unwrap();
+        drop(first);
+
+        let mut second_config = base_config(dir.path());
+        second_config.snapshot_id = Some(2);
+        let error = match Export::open(second_config, remote).await {
+            Ok(_) => panic!("expected snapshot switch with dirty cache to fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot switch to generation 2"));
+    }
+
+    #[tokio::test]
+    async fn reset_cache_discards_local_state_and_allows_switching_snapshots() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-1.blob",
+                Bytes::from_static(b"abcdefgh"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-2.blob",
+                Bytes::from_static(b"wxyz1234"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/1/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":1,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-1.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/2/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":2,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-2.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut first_config = base_config(dir.path());
+        first_config.snapshot_id = Some(1);
+        let first = Export::open(first_config, remote.clone()).await.unwrap();
+        assert_eq!(first.read(0, 8).await.unwrap(), b"abcdefgh");
+        first.write(0, b"ZZZZ", false).await.unwrap();
+
+        let reset = first.reset_cache().await.unwrap();
+        assert_eq!(reset.discarded_dirty_chunks, 1);
+        assert!(reset.discarded_resident_chunks >= 1);
+
+        let status = first.status().await;
+        assert_eq!(status.dirty_chunks, 0);
+        assert_eq!(status.resident_chunks, 0);
+
+        first.shutdown().unwrap();
+        drop(first);
+
+        let mut second_config = base_config(dir.path());
+        second_config.snapshot_id = Some(2);
+        let second = Export::open(second_config, remote).await.unwrap();
+        assert_eq!(second.read(0, 8).await.unwrap(), b"wxyz1234");
     }
 
     #[tokio::test]

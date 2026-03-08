@@ -158,6 +158,23 @@ impl LocalCache {
         meta.persist(&self.meta_path, true)
     }
 
+    pub fn rebind_manifest_generation(&self, generation: u64) -> Result<()> {
+        let mut meta = self.meta.lock().unwrap();
+        if meta.manifest_generation == generation {
+            return Ok(());
+        }
+        let dirty_count = meta.dirty.count_ones();
+        if dirty_count != 0 {
+            return Err(Error::InvalidRequest(format!(
+                "cache has {dirty_count} dirty chunks for manifest generation {}, cannot switch to generation {generation}",
+                meta.manifest_generation
+            )));
+        }
+        meta.resident.clear_all();
+        meta.manifest_generation = generation;
+        meta.persist(&self.meta_path, true)
+    }
+
     pub fn is_resident(&self, index: usize) -> bool {
         self.meta.lock().unwrap().resident.get(index)
     }
@@ -190,6 +207,16 @@ impl LocalCache {
         let mut meta = self.meta.lock().unwrap();
         meta.dirty.clear_all();
         meta.persist(&self.meta_path, true)
+    }
+
+    pub fn reset_local_state(&self) -> Result<(usize, usize)> {
+        let mut meta = self.meta.lock().unwrap();
+        let dirty = meta.dirty.count_ones();
+        let resident = meta.resident.count_ones();
+        meta.dirty.clear_all();
+        meta.resident.clear_all();
+        meta.persist(&self.meta_path, true)?;
+        Ok((dirty, resident))
     }
 
     pub fn dirty_indices(&self) -> Vec<usize> {

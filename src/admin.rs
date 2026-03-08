@@ -32,6 +32,7 @@ pub async fn serve_admin(socket_path: &Path, export: Arc<Export>) -> crate::Resu
         .route("/v1/status", get(get_status))
         .route("/v1/snapshot", post(post_snapshot))
         .route("/v1/compact", post(post_compact))
+        .route("/v1/cache/reset", post(post_reset_cache))
         .with_state(AdminState { export });
     axum::serve(listener, router)
         .await
@@ -59,6 +60,17 @@ async fn post_compact(
     state
         .export
         .compact()
+        .await
+        .map(Json)
+        .map_err(error_response)
+}
+
+async fn post_reset_cache(
+    State(state): State<AdminState>,
+) -> std::result::Result<Json<crate::export::ResetCacheResponse>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .export
+        .reset_cache()
         .await
         .map(Json)
         .map_err(error_response)
