@@ -86,6 +86,8 @@ cargo run -- open \
   --admin-sock /tmp/nbd-server-vm-001.sock
 ```
 
+Reusing the same `--cache-dir` across generations is supported only when the local cache has no dirty chunks. If the cache still contains unsnapshotted local writes for another generation, `open` fails instead of silently mixing snapshot lineages.
+
 For R2, add:
 
 ```bash
@@ -147,6 +149,15 @@ curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
 ```bash
 curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
   http://localhost/v1/compact
+```
+
+### Reset Cache
+
+Discard all local dirty and resident cache state for the current export. This is destructive for unsnapshotted local writes and is intended for cases where you want to abandon local changes before reopening another snapshot with the same `--cache-dir`.
+
+```bash
+curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
+  http://localhost/v1/cache/reset
 ```
 
 ## Remote Layout
