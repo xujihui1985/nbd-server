@@ -43,6 +43,8 @@ pub struct ServerConfigArgs {
     #[arg(long, default_value_t = CHUNK_SIZE)]
     pub chunk_size: u64,
     #[arg(long)]
+    pub snapshot_id: Option<u64>,
+    #[arg(long)]
     pub size: Option<u64>,
 }
 
@@ -70,6 +72,7 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub admin_sock: PathBuf,
     pub chunk_size: u64,
+    pub snapshot_id: Option<u64>,
     pub image_size: Option<u64>,
 }
 
@@ -89,6 +92,7 @@ impl From<ServerConfigArgs> for ServerConfig {
             listen: value.listen,
             admin_sock: value.admin_sock,
             chunk_size: value.chunk_size,
+            snapshot_id: value.snapshot_id,
             image_size: value.size,
         }
     }

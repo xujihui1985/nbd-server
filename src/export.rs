@@ -112,6 +112,11 @@ impl Export {
         config: ServerConfig,
         remote: Arc<dyn StorageBackend>,
     ) -> Result<Arc<Self>> {
+        if config.snapshot_id.is_some() {
+            return Err(Error::InvalidRequest(
+                "--snapshot-id is only valid with the open command".to_string(),
+            ));
+        }
         if config.image_size.is_none() {
             return Err(Error::InvalidRequest(
                 "--size is required when creating a new export".to_string(),
@@ -154,13 +159,17 @@ impl Export {
     }
 
     pub async fn open(config: ServerConfig, remote: Arc<dyn StorageBackend>) -> Result<Arc<Self>> {
-        let current_ref: CurrentRef = serde_json::from_slice(
-            &remote
-                .get_object(&current_ref_key(&config.storage.prefix))
-                .await?,
-        )?;
-        let manifest: Manifest =
-            serde_json::from_slice(&remote.get_object(&current_ref.manifest_key).await?)?;
+        let manifest_key = if let Some(snapshot_id) = config.snapshot_id {
+            manifest_key(&config.storage.prefix, snapshot_id)
+        } else {
+            let current_ref: CurrentRef = serde_json::from_slice(
+                &remote
+                    .get_object(&current_ref_key(&config.storage.prefix))
+                    .await?,
+            )?;
+            current_ref.manifest_key
+        };
+        let manifest: Manifest = serde_json::from_slice(&remote.get_object(&manifest_key).await?)?;
         manifest.validate()?;
 
         let cache = if config.cache_dir.join("cache.meta").exists() {
@@ -868,6 +877,7 @@ mod tests {
             listen: "127.0.0.1:10809".parse().unwrap(),
             admin_sock: dir.join("admin.sock"),
             chunk_size: 4,
+            snapshot_id: None,
             image_size: Some(8),
         }
     }
@@ -940,6 +950,83 @@ mod tests {
             .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         assert_eq!(manifest["generation"], 2);
+    }
+
+    #[tokio::test]
+    async fn open_uses_explicit_snapshot_id_instead_of_current_head() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-1.blob",
+                Bytes::from_static(b"abcdefgh"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/base/snapshot-2.blob",
+                Bytes::from_static(b"wxyz1234"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/refs/current.json",
+                Bytes::from_static(
+                    br#"{"generation":2,"manifest_key":"exports/export/snapshots/2/manifest.json"}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/1/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":1,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-1.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/2/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":2,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/snapshot-2.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut config = base_config(dir.path());
+        config.snapshot_id = Some(1);
+        let export = Export::open(config, remote).await.unwrap();
+
+        let status = export.status().await;
+        assert_eq!(status.remote_head_generation, 1);
+        assert_eq!(export.read(0, 8).await.unwrap(), b"abcdefgh");
     }
 
     #[tokio::test]

@@ -73,6 +73,19 @@ cargo run -- open \
   --admin-sock /tmp/nbd-server-vm-001.sock
 ```
 
+By default, `open` resolves `exports/<id>/refs/current.json`. To open a specific snapshot generation instead:
+
+```bash
+cargo run -- open \
+  --export-id vm-001 \
+  --cache-dir /var/lib/nbd-server/vm-001 \
+  --bucket my-bucket \
+  --prefix exports/vm-001 \
+  --snapshot-id 7 \
+  --listen 127.0.0.1:10809 \
+  --admin-sock /tmp/nbd-server-vm-001.sock
+```
+
 For R2, add:
 
 ```bash
