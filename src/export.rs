@@ -448,9 +448,9 @@ impl Export {
             object_key = %object_key,
             "starting full snapshot upload"
         );
-        self.remote
-            .put_file(&object_key, self.cache.raw_path())
-            .await?;
+        // self.remote
+        //     .put_file(&object_key, self.cache.raw_path())
+        //     .await?;
         tracing::info!(
             generation,
             operation = ?operation,
