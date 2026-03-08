@@ -22,30 +22,65 @@ pub trait StorageBackend: Send + Sync {
 
 #[derive(Clone)]
 pub struct S3CompatibleStorageBackend {
+    backend_name: &'static str,
     bucket: String,
+    region: String,
+    endpoint_url: Option<String>,
+    force_path_style: bool,
     client: Client,
 }
 
 impl S3CompatibleStorageBackend {
     pub async fn new(
+        backend_name: &'static str,
         bucket: String,
         region: String,
         endpoint_url: Option<String>,
         force_path_style: bool,
     ) -> Result<Self> {
         let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region))
+            .region(Region::new(region.clone()))
             .load()
             .await;
         let mut builder = S3ConfigBuilder::from(&shared_config).force_path_style(force_path_style);
-        if let Some(endpoint_url) = endpoint_url {
+        if let Some(endpoint_url) = endpoint_url.clone() {
             builder = builder.endpoint_url(endpoint_url);
         }
 
         Ok(Self {
+            backend_name,
             bucket,
+            region,
+            endpoint_url,
+            force_path_style,
             client: Client::from_conf(builder.build()),
         })
+    }
+
+    fn format_error(
+        &self,
+        operation: &str,
+        key: &str,
+        extra: Option<&str>,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Error {
+        let endpoint = self
+            .endpoint_url
+            .as_deref()
+            .unwrap_or("<aws-default-endpoint>");
+        let extra = extra.map(|value| format!(" {value}")).unwrap_or_default();
+        Error::Storage(format!(
+            "backend={} bucket={} region={} endpoint={} path_style={} op={} key={}{} cause={}",
+            self.backend_name,
+            self.bucket,
+            self.region,
+            endpoint,
+            self.force_path_style,
+            operation,
+            key,
+            extra,
+            format_error_chain(error),
+        ))
     }
 }
 
@@ -64,12 +99,12 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .range(range)
             .send()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("get_range", key, None, &error))?;
         let body = response
             .body
             .collect()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("collect_body", key, None, &error))?;
         Ok(body.into_bytes())
     }
 
@@ -81,12 +116,12 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .key(key)
             .send()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("get_object", key, None, &error))?;
         let body = response
             .body
             .collect()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("collect_body", key, None, &error))?;
         Ok(body.into_bytes())
     }
 
@@ -98,14 +133,17 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("put_bytes", key, None, &error))?;
         Ok(())
     }
 
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+        let path_hint = format!("path={}", path.display());
         let body = ByteStream::from_path(path.to_path_buf())
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| {
+                self.format_error("read_upload_file", key, Some(&path_hint), &error)
+            })?;
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -113,7 +151,7 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .body(body)
             .send()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("put_file", key, Some(&path_hint), &error))?;
         Ok(())
     }
 
@@ -124,14 +162,14 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .key(key)
             .send()
             .await
-            .map_err(|error| Error::S3(error.to_string()))?;
+            .map_err(|error| self.format_error("delete_object", key, None, &error))?;
         Ok(())
     }
 }
 
 pub async fn build_storage_backend(config: &StorageConfig) -> Result<Arc<dyn StorageBackend>> {
-    let (endpoint_url, force_path_style) = match config.backend {
-        StorageBackendKind::S3 => (config.endpoint_url.clone(), false),
+    let (endpoint_url, force_path_style, backend_name) = match config.backend {
+        StorageBackendKind::S3 => (config.endpoint_url.clone(), false, "s3"),
         StorageBackendKind::R2 => {
             let endpoint = match (&config.endpoint_url, &config.r2_account_id) {
                 (Some(endpoint_url), _) => endpoint_url.clone(),
@@ -144,12 +182,13 @@ pub async fn build_storage_backend(config: &StorageConfig) -> Result<Arc<dyn Sto
                     ));
                 }
             };
-            (Some(endpoint), true)
+            (Some(endpoint), true, "r2")
         }
     };
 
     Ok(Arc::new(
         S3CompatibleStorageBackend::new(
+            backend_name,
             config.bucket.clone(),
             config.region.clone(),
             endpoint_url,
@@ -157,4 +196,15 @@ pub async fn build_storage_backend(config: &StorageConfig) -> Result<Arc<dyn Sto
         )
         .await?,
     ))
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(next) = source {
+        message.push_str("; caused by: ");
+        message.push_str(&next.to_string());
+        source = next.source();
+    }
+    message
 }

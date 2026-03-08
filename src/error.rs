@@ -10,8 +10,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("s3 error: {0}")]
-    S3(String),
+    #[error("storage error: {0}")]
+    Storage(String),
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
     #[error("invalid request: {0}")]
