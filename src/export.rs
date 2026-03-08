@@ -348,13 +348,7 @@ impl Export {
             .map(|manifest| manifest.referenced_object_keys());
 
         let result = if remote_head.generation() == 0 {
-            self.publish_full_snapshot(
-                next_generation,
-                JournalOperation::Snapshot,
-                format!("{}/base/full.blob", self.config.storage.prefix),
-                previous_keys,
-            )
-            .await
+            self.publish_initial_sparse_snapshot(next_generation).await
         } else {
             self.publish_delta_snapshot(next_generation, remote_head, previous_keys)
                 .await
@@ -448,9 +442,9 @@ impl Export {
             object_key = %object_key,
             "starting full snapshot upload"
         );
-        // self.remote
-        //     .put_file(&object_key, self.cache.raw_path())
-        //     .await?;
+        self.remote
+            .put_file(&object_key, self.cache.raw_path())
+            .await?;
         tracing::info!(
             generation,
             operation = ?operation,
@@ -463,9 +457,114 @@ impl Export {
             image_size,
             self.cache.chunk_size(),
             object_key,
-            self.compute_full_checksums()?,
         )?;
         let gc = self.publish_manifest(manifest, previous_keys).await?;
+        Ok(SnapshotResponse {
+            snapshot_created: true,
+            generation,
+            garbage_collected_objects: gc,
+        })
+    }
+
+    async fn publish_initial_sparse_snapshot(&self, generation: u64) -> Result<SnapshotResponse> {
+        let dirty = self.cache.dirty_indices();
+        if dirty.is_empty() {
+            tracing::info!(
+                generation,
+                image_size = self.cache.image_size(),
+                "publishing initial zero-backed manifest without data objects"
+            );
+            let manifest = Manifest::empty(
+                self.config.export_id.clone(),
+                generation,
+                self.cache.image_size(),
+                self.cache.chunk_size(),
+            )?;
+            let gc = self.publish_manifest(manifest, None).await?;
+            return Ok(SnapshotResponse {
+                snapshot_created: true,
+                generation,
+                garbage_collected_objects: gc,
+            });
+        }
+
+        let delta_path = self
+            .config
+            .cache_dir
+            .join(format!("snapshot-{generation}.delta.blob"));
+        let delta_key = format!(
+            "{}/snapshots/{generation}/delta.blob",
+            self.config.storage.prefix
+        );
+        let manifest_key = manifest_key(&self.config.storage.prefix, generation);
+
+        let mut delta_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&delta_path)?;
+        let mut replacements = BTreeMap::new();
+        let mut cursor = 0_u64;
+        for index in dirty {
+            let _chunk_guard = self.chunk_locks[index].lock().await;
+            let logical_len = chunk_len(
+                self.cache.image_size(),
+                self.cache.chunk_size(),
+                index as u64,
+            );
+            let bytes = self.cache.read_exact_at(
+                chunk_offset(self.cache.chunk_size(), index as u64),
+                logical_len as usize,
+            )?;
+            delta_file.write_all(&bytes)?;
+            replacements.insert(
+                index as u64,
+                ReplacementChunk {
+                    object_offset: cursor,
+                    logical_len,
+                    checksum: blake3::hash(&bytes).to_hex().to_string(),
+                },
+            );
+            cursor += logical_len;
+        }
+        delta_file.sync_all()?;
+
+        JournalRecord {
+            version: 1,
+            operation: JournalOperation::Snapshot,
+            generation,
+            staging_path: Some(delta_path.display().to_string()),
+            object_key: delta_key.clone(),
+            manifest_key: manifest_key.clone(),
+        }
+        .persist(&self.journal_path)?;
+
+        tracing::info!(
+            generation,
+            dirty_chunks = replacements.len(),
+            delta_bytes = cursor,
+            object_key = %delta_key,
+            "starting initial sparse snapshot upload"
+        );
+        self.remote.put_file(&delta_key, &delta_path).await?;
+        tracing::info!(
+            generation,
+            dirty_chunks = replacements.len(),
+            delta_bytes = cursor,
+            object_key = %delta_key,
+            "finished initial sparse snapshot upload"
+        );
+
+        let manifest = Manifest::empty(
+            self.config.export_id.clone(),
+            generation,
+            self.cache.image_size(),
+            self.cache.chunk_size(),
+        )?
+        .with_new_ref(generation, delta_key, replacements)?;
+        let gc = self.publish_manifest(manifest, None).await?;
+        remove_file(&delta_path).ok();
+
         Ok(SnapshotResponse {
             snapshot_created: true,
             generation,
@@ -557,7 +656,7 @@ impl Export {
         let manifest = remote_head
             .manifest()
             .ok_or_else(|| Error::InvalidManifest("missing remote manifest".to_string()))?
-            .with_delta(generation, delta_key, cursor, replacements)?;
+            .with_new_ref(generation, delta_key, replacements)?;
         let gc = self.publish_manifest(manifest, previous_keys).await?;
         remove_file(&delta_path).ok();
 
@@ -651,7 +750,7 @@ impl Export {
         let location = remote_head.chunk_location(index)?;
         match location.source {
             ChunkSource::Zero => Ok(vec![0_u8; location.logical_len as usize]),
-            ChunkSource::Object => Ok(self
+            ChunkSource::Ref => Ok(self
                 .remote
                 .get_range(
                     location
@@ -664,23 +763,6 @@ impl Export {
                 .await?
                 .to_vec()),
         }
-    }
-
-    fn compute_full_checksums(&self) -> Result<Vec<String>> {
-        let mut checksums = Vec::with_capacity(self.cache.chunk_count());
-        for index in 0..self.cache.chunk_count() {
-            let logical_len = chunk_len(
-                self.cache.image_size(),
-                self.cache.chunk_size(),
-                index as u64,
-            );
-            let bytes = self.cache.read_exact_at(
-                chunk_offset(self.cache.chunk_size(), index as u64),
-                logical_len as usize,
-            )?;
-            checksums.push(blake3::hash(&bytes).to_hex().to_string());
-        }
-        Ok(checksums)
     }
 
     fn validate_range(&self, offset: u64, len: u64) -> Result<()> {
@@ -813,20 +895,20 @@ mod tests {
         remote
             .put_bytes(
                 "exports/export/snapshots/1/manifest.json",
-                Bytes::from_static(br#"{
-                    "version":1,
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
                     "export_id":"export",
                     "generation":1,
                     "image_size":8,
                     "chunk_size":4,
                     "chunk_count":2,
                     "created_at":"2026-03-07T00:00:00Z",
-                    "objects":[{"id":1,"kind":"base","generation":1,"key":"exports/export/base/full.blob","size":8}],
-                    "chunks":[
-                        {"index":0,"source":"object","object_id":1,"object_offset":0,"logical_len":4,"blake3":"a"},
-                        {"index":1,"source":"object","object_id":1,"object_offset":4,"logical_len":4,"blake3":"b"}
-                    ]
-                }"#),
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/full.blob"}],
+                    "entries":[]
+                }"#,
+                ),
             )
             .await
             .unwrap();
@@ -861,6 +943,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_snapshot_of_new_export_stores_only_dirty_chunks() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        let export = Export::create(base_config(dir.path()), remote.clone())
+            .await
+            .unwrap();
+
+        export.write(0, b"abcd", false).await.unwrap();
+        let first = export.snapshot().await.unwrap();
+        assert_eq!(first.generation, 1);
+
+        let manifest = remote
+            .get_object("exports/export/snapshots/1/manifest.json")
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(manifest["base_ref"], serde_json::Value::Null);
+        assert_eq!(manifest["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["entries"][0]["index"], 0);
+        assert!(
+            !remote
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("exports/export/base/full.blob")
+        );
+        assert!(
+            remote
+                .objects
+                .lock()
+                .unwrap()
+                .contains_key("exports/export/snapshots/1/delta.blob")
+        );
+    }
+
+    #[tokio::test]
     async fn compact_rewrites_full_base_and_collects_old_delta() {
         let dir = tempdir().unwrap();
         let remote = Arc::new(MemoryRemote::default());
@@ -881,7 +999,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|key| key == "exports/export/base/full.blob")
+                .any(|key| key == "exports/export/snapshots/1/delta.blob")
         );
         assert!(
             remote

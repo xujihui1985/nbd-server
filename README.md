@@ -10,7 +10,7 @@
 - Partial writes on missing chunks first materialize the full chunk from remote, then merge the write locally.
 - `FLUSH` only guarantees local durability.
 - `SNAPSHOT` publishes remote state:
-  - first publish uploads a full base object
+  - for a brand-new export, the first publish writes a sparse manifest with no `base_ref` and uploads only dirty chunks into one data blob
   - later publishes upload one packed delta blob containing only dirty chunks
   - each publish writes a complete human-readable `manifest.json`
 - `COMPACT` rewrites the entire current image into a fresh base object and garbage-collects unreferenced remote data objects.
@@ -140,7 +140,6 @@ curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
 
 - `exports/<id>/refs/current.json`
 - `exports/<id>/snapshots/<generation>/manifest.json`
-- `exports/<id>/base/full.blob`
 - `exports/<id>/snapshots/<generation>/delta.blob`
 - `exports/<id>/snapshots/<generation>/base.blob` for compaction output
 

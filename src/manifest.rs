@@ -5,40 +5,20 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::error::{Error, Result};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ObjectKind {
-    Base,
-    Delta,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ObjectEntry {
+pub struct RefEntry {
     pub id: u32,
-    pub kind: ObjectKind,
-    pub generation: u64,
-    pub key: String,
-    pub size: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ChunkSource {
-    Zero,
-    Object,
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChunkEntry {
+pub struct ManifestEntry {
     pub index: u64,
-    pub source: ChunkSource,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_id: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_offset: Option<u64>,
-    pub logical_len: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blake3: Option<String>,
+    #[serde(rename = "ref")]
+    pub ref_id: u32,
+    pub offset: u64,
+    pub len: u32,
+    pub blake3: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,8 +30,16 @@ pub struct Manifest {
     pub chunk_size: u64,
     pub chunk_count: u64,
     pub created_at: String,
-    pub objects: Vec<ObjectEntry>,
-    pub chunks: Vec<ChunkEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<u32>,
+    pub refs: Vec<RefEntry>,
+    pub entries: Vec<ManifestEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChunkSource {
+    Zero,
+    Ref,
 }
 
 #[derive(Clone, Debug)]
@@ -62,81 +50,96 @@ pub struct ChunkLocation {
     pub logical_len: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReplacementChunk {
+    pub object_offset: u64,
+    pub logical_len: u64,
+    pub checksum: String,
+}
+
 impl Manifest {
+    pub fn empty(
+        export_id: String,
+        generation: u64,
+        image_size: u64,
+        chunk_size: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            version: 2,
+            export_id,
+            generation,
+            image_size,
+            chunk_size,
+            chunk_count: chunk_count(image_size, chunk_size),
+            created_at: now_rfc3339()?,
+            base_ref: None,
+            refs: Vec::new(),
+            entries: Vec::new(),
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(Error::InvalidManifest(format!(
                 "unsupported manifest version {}",
                 self.version
             )));
         }
 
-        if self.chunk_count != self.chunks.len() as u64 {
+        if self.chunk_count != chunk_count(self.image_size, self.chunk_size) {
             return Err(Error::InvalidManifest(format!(
-                "chunk count {} does not match entry count {}",
+                "chunk count {} does not match image/chunk size derived count {}",
                 self.chunk_count,
-                self.chunks.len()
+                chunk_count(self.image_size, self.chunk_size)
             )));
         }
 
-        let objects: BTreeMap<u32, &ObjectEntry> = self
-            .objects
-            .iter()
-            .map(|object| (object.id, object))
-            .collect();
-
-        for (expected_index, chunk) in self.chunks.iter().enumerate() {
-            if chunk.index != expected_index as u64 {
+        let refs: BTreeMap<u32, &RefEntry> =
+            self.refs.iter().map(|entry| (entry.id, entry)).collect();
+        if let Some(base_ref) = self.base_ref {
+            if !refs.contains_key(&base_ref) {
                 return Err(Error::InvalidManifest(format!(
-                    "chunk index {} out of sequence at position {}",
-                    chunk.index, expected_index
+                    "base_ref {} missing from refs",
+                    base_ref
                 )));
             }
+        }
 
-            match chunk.source {
-                ChunkSource::Zero => {
-                    if chunk.object_id.is_some()
-                        || chunk.object_offset.is_some()
-                        || chunk.blake3.is_some()
-                    {
-                        return Err(Error::InvalidManifest(format!(
-                            "zero chunk {} unexpectedly references an object",
-                            chunk.index
-                        )));
-                    }
+        let mut last_index = None;
+        for entry in &self.entries {
+            if entry.index >= self.chunk_count {
+                return Err(Error::InvalidManifest(format!(
+                    "entry index {} out of bounds for chunk count {}",
+                    entry.index, self.chunk_count
+                )));
+            }
+            if let Some(previous) = last_index {
+                if entry.index <= previous {
+                    return Err(Error::InvalidManifest(format!(
+                        "entries not strictly ordered: {} after {}",
+                        entry.index, previous
+                    )));
                 }
-                ChunkSource::Object => {
-                    let object_id = chunk.object_id.ok_or_else(|| {
-                        Error::InvalidManifest(format!("chunk {} missing object id", chunk.index))
-                    })?;
-                    let offset = chunk.object_offset.ok_or_else(|| {
-                        Error::InvalidManifest(format!(
-                            "chunk {} missing object offset",
-                            chunk.index
-                        ))
-                    })?;
-                    let object = objects.get(&object_id).ok_or_else(|| {
-                        Error::InvalidManifest(format!(
-                            "chunk {} references unknown object {}",
-                            chunk.index, object_id
-                        ))
-                    })?;
-                    let end = offset
-                        .checked_add(chunk.logical_len as u64)
-                        .ok_or_else(|| Error::InvalidManifest("chunk overflow".to_string()))?;
-                    if end > object.size {
-                        return Err(Error::InvalidManifest(format!(
-                            "chunk {} extends beyond object {}",
-                            chunk.index, object_id
-                        )));
-                    }
-                    if chunk.blake3.is_none() {
-                        return Err(Error::InvalidManifest(format!(
-                            "chunk {} missing checksum",
-                            chunk.index
-                        )));
-                    }
-                }
+            }
+            last_index = Some(entry.index);
+
+            if !refs.contains_key(&entry.ref_id) {
+                return Err(Error::InvalidManifest(format!(
+                    "entry {} references unknown ref {}",
+                    entry.index, entry.ref_id
+                )));
+            }
+            if entry.len as u64 != chunk_len(self.image_size, self.chunk_size, entry.index) {
+                return Err(Error::InvalidManifest(format!(
+                    "entry {} has invalid len {}",
+                    entry.index, entry.len
+                )));
+            }
+            if entry.blake3.is_empty() {
+                return Err(Error::InvalidManifest(format!(
+                    "entry {} missing checksum",
+                    entry.index
+                )));
             }
         }
 
@@ -144,56 +147,59 @@ impl Manifest {
     }
 
     pub fn chunk_location(&self, index: u64) -> Result<ChunkLocation> {
-        let chunk = self
-            .chunks
-            .get(index as usize)
-            .ok_or_else(|| Error::InvalidManifest(format!("chunk {index} missing")))?;
-
-        match chunk.source {
-            ChunkSource::Zero => Ok(ChunkLocation {
-                source: ChunkSource::Zero,
-                object_key: None,
-                object_offset: 0,
-                logical_len: chunk.logical_len,
-            }),
-            ChunkSource::Object => {
-                let object_id = chunk.object_id.ok_or_else(|| {
-                    Error::InvalidManifest(format!("chunk {} missing object id", chunk.index))
-                })?;
-                let object = self
-                    .objects
-                    .iter()
-                    .find(|object| object.id == object_id)
-                    .ok_or_else(|| {
-                        Error::InvalidManifest(format!(
-                            "chunk {} references unknown object {}",
-                            chunk.index, object_id
-                        ))
-                    })?;
-                Ok(ChunkLocation {
-                    source: ChunkSource::Object,
-                    object_key: Some(object.key.clone()),
-                    object_offset: chunk.object_offset.unwrap_or_default(),
-                    logical_len: chunk.logical_len,
-                })
-            }
+        if index >= self.chunk_count {
+            return Err(Error::InvalidManifest(format!("chunk {index} missing")));
         }
+
+        if let Some(entry) = self.entries.iter().find(|entry| entry.index == index) {
+            let reference = self
+                .refs
+                .iter()
+                .find(|reference| reference.id == entry.ref_id)
+                .ok_or_else(|| {
+                    Error::InvalidManifest(format!(
+                        "entry {} references unknown ref {}",
+                        entry.index, entry.ref_id
+                    ))
+                })?;
+            return Ok(ChunkLocation {
+                source: ChunkSource::Ref,
+                object_key: Some(reference.path.clone()),
+                object_offset: entry.offset,
+                logical_len: entry.len,
+            });
+        }
+
+        if let Some(base_ref) = self.base_ref {
+            let reference = self
+                .refs
+                .iter()
+                .find(|reference| reference.id == base_ref)
+                .ok_or_else(|| {
+                    Error::InvalidManifest(format!("base_ref {} missing from refs", base_ref))
+                })?;
+            return Ok(ChunkLocation {
+                source: ChunkSource::Ref,
+                object_key: Some(reference.path.clone()),
+                object_offset: index * self.chunk_size,
+                logical_len: chunk_len(self.image_size, self.chunk_size, index) as u32,
+            });
+        }
+
+        Ok(ChunkLocation {
+            source: ChunkSource::Zero,
+            object_key: None,
+            object_offset: 0,
+            logical_len: chunk_len(self.image_size, self.chunk_size, index) as u32,
+        })
     }
 
-    pub fn next_object_id(&self) -> u32 {
-        self.objects
-            .iter()
-            .map(|object| object.id)
-            .max()
-            .unwrap_or(0)
-            + 1
+    pub fn next_ref_id(&self) -> u32 {
+        self.refs.iter().map(|entry| entry.id).max().unwrap_or(0) + 1
     }
 
     pub fn referenced_object_keys(&self) -> BTreeSet<String> {
-        self.objects
-            .iter()
-            .map(|object| object.key.clone())
-            .collect()
+        self.refs.iter().map(|entry| entry.path.clone()).collect()
     }
 
     pub fn from_full_base(
@@ -201,102 +207,77 @@ impl Manifest {
         generation: u64,
         image_size: u64,
         chunk_size: u64,
-        base_key: String,
-        checksums: Vec<String>,
+        base_path: String,
     ) -> Result<Self> {
-        let chunk_count = chunk_count(image_size, chunk_size);
-        if checksums.len() != chunk_count as usize {
-            return Err(Error::InvalidManifest(
-                "full snapshot checksum count mismatch".to_string(),
-            ));
-        }
-
-        let mut chunks = Vec::with_capacity(chunk_count as usize);
-        for index in 0..chunk_count {
-            chunks.push(ChunkEntry {
-                index,
-                source: ChunkSource::Object,
-                object_id: Some(1),
-                object_offset: Some(index * chunk_size),
-                logical_len: chunk_len(image_size, chunk_size, index) as u32,
-                blake3: Some(checksums[index as usize].clone()),
-            });
-        }
-
         Ok(Self {
-            version: 1,
+            version: 2,
             export_id,
             generation,
             image_size,
             chunk_size,
-            chunk_count,
-            created_at: OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .map_err(|error| Error::InvalidManifest(error.to_string()))?,
-            objects: vec![ObjectEntry {
+            chunk_count: chunk_count(image_size, chunk_size),
+            created_at: now_rfc3339()?,
+            base_ref: Some(1),
+            refs: vec![RefEntry {
                 id: 1,
-                kind: ObjectKind::Base,
-                generation,
-                key: base_key,
-                size: image_size,
+                path: base_path,
             }],
-            chunks,
+            entries: Vec::new(),
         })
     }
 
-    pub fn with_delta(
+    pub fn with_new_ref(
         &self,
         generation: u64,
-        delta_key: String,
-        delta_len: u64,
+        ref_path: String,
         replacements: BTreeMap<u64, ReplacementChunk>,
     ) -> Result<Self> {
-        let mut objects = self.objects.clone();
-        let new_object_id = self.next_object_id();
-        objects.push(ObjectEntry {
-            id: new_object_id,
-            kind: ObjectKind::Delta,
-            generation,
-            key: delta_key,
-            size: delta_len,
+        let mut refs = self.refs.clone();
+        let ref_id = self.next_ref_id();
+        refs.push(RefEntry {
+            id: ref_id,
+            path: ref_path,
         });
 
-        let mut chunks = self.chunks.clone();
+        let mut entries: BTreeMap<u64, ManifestEntry> = self
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.index, entry))
+            .collect();
+
         for (index, replacement) in replacements {
-            let chunk = chunks
-                .get_mut(index as usize)
-                .ok_or_else(|| Error::InvalidManifest(format!("chunk {index} missing")))?;
-            chunk.source = ChunkSource::Object;
-            chunk.object_id = Some(new_object_id);
-            chunk.object_offset = Some(replacement.object_offset);
-            chunk.logical_len = replacement.logical_len as u32;
-            chunk.blake3 = Some(replacement.checksum);
+            entries.insert(
+                index,
+                ManifestEntry {
+                    index,
+                    ref_id,
+                    offset: replacement.object_offset,
+                    len: replacement.logical_len as u32,
+                    blake3: replacement.checksum,
+                },
+            );
         }
 
-        let referenced: BTreeSet<u32> = chunks.iter().filter_map(|chunk| chunk.object_id).collect();
-        objects.retain(|object| referenced.contains(&object.id));
-
         Ok(Self {
-            version: 1,
+            version: 2,
             export_id: self.export_id.clone(),
             generation,
             image_size: self.image_size,
             chunk_size: self.chunk_size,
             chunk_count: self.chunk_count,
-            created_at: OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .map_err(|error| Error::InvalidManifest(error.to_string()))?,
-            objects,
-            chunks,
+            created_at: now_rfc3339()?,
+            base_ref: self.base_ref,
+            refs,
+            entries: entries.into_values().collect(),
         })
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ReplacementChunk {
-    pub object_offset: u64,
-    pub logical_len: u64,
-    pub checksum: String,
+fn now_rfc3339() -> Result<String> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|error| Error::InvalidManifest(error.to_string()))
 }
 
 pub fn chunk_count(image_size: u64, chunk_size: u64) -> u64 {
@@ -319,17 +300,8 @@ mod tests {
     use super::{Manifest, ReplacementChunk};
 
     #[test]
-    fn delta_manifest_rewrites_only_selected_chunks() {
-        let base = Manifest::from_full_base(
-            "export".to_string(),
-            1,
-            8,
-            4,
-            "base/full.blob".to_string(),
-            vec!["a".to_string(), "b".to_string()],
-        )
-        .unwrap();
-
+    fn sparse_manifest_rewrites_only_selected_entries() {
+        let base = Manifest::empty("export".to_string(), 1, 8, 4).unwrap();
         let mut replacements = BTreeMap::new();
         replacements.insert(
             1,
@@ -341,11 +313,11 @@ mod tests {
         );
 
         let updated = base
-            .with_delta(2, "snapshots/2/delta.blob".to_string(), 4, replacements)
+            .with_new_ref(2, "snapshots/2/data.blob".to_string(), replacements)
             .unwrap();
 
-        assert_eq!(updated.chunks[0].blake3.as_deref(), Some("a"));
-        assert_eq!(updated.chunks[1].blake3.as_deref(), Some("c"));
-        assert_eq!(updated.generation, 2);
+        assert_eq!(updated.entries.len(), 1);
+        assert_eq!(updated.entries[0].index, 1);
+        assert_eq!(updated.entries[0].ref_id, 1);
     }
 }
