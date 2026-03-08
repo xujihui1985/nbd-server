@@ -93,6 +93,8 @@ struct CurrentRef {
     manifest_key: String,
 }
 
+const SINGLE_PUT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 pub struct Export {
     config: ServerConfig,
     cache: Arc<LocalCache>,
@@ -420,10 +422,18 @@ impl Export {
         object_key: String,
         previous_keys: Option<BTreeSet<String>>,
     ) -> Result<SnapshotResponse> {
+        let image_size = self.cache.image_size();
+        if image_size > SINGLE_PUT_LIMIT_BYTES {
+            return Err(Error::InvalidRequest(format!(
+                "full snapshot requires uploading {} bytes to {}, but single-put support is limited to {} bytes; multipart upload is not implemented",
+                image_size, object_key, SINGLE_PUT_LIMIT_BYTES
+            )));
+        }
+
         let manifest_key = manifest_key(&self.config.storage.prefix, generation);
         JournalRecord {
             version: 1,
-            operation,
+            operation: operation.clone(),
             generation,
             staging_path: None,
             object_key: object_key.clone(),
@@ -431,13 +441,26 @@ impl Export {
         }
         .persist(&self.journal_path)?;
 
+        tracing::info!(
+            generation,
+            operation = ?operation,
+            image_size,
+            object_key = %object_key,
+            "starting full snapshot upload"
+        );
         self.remote
             .put_file(&object_key, self.cache.raw_path())
             .await?;
+        tracing::info!(
+            generation,
+            operation = ?operation,
+            object_key = %object_key,
+            "finished full snapshot upload"
+        );
         let manifest = Manifest::from_full_base(
             self.config.export_id.clone(),
             generation,
-            self.cache.image_size(),
+            image_size,
             self.cache.chunk_size(),
             object_key,
             self.compute_full_checksums()?,
@@ -516,7 +539,21 @@ impl Export {
         }
         .persist(&self.journal_path)?;
 
+        tracing::info!(
+            generation,
+            dirty_chunks = replacements.len(),
+            delta_bytes = cursor,
+            object_key = %delta_key,
+            "starting delta snapshot upload"
+        );
         self.remote.put_file(&delta_key, &delta_path).await?;
+        tracing::info!(
+            generation,
+            dirty_chunks = replacements.len(),
+            delta_bytes = cursor,
+            object_key = %delta_key,
+            "finished delta snapshot upload"
+        );
         let manifest = remote_head
             .manifest()
             .ok_or_else(|| Error::InvalidManifest("missing remote manifest".to_string()))?
