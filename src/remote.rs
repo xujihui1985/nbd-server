@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_types::region::Region;
 use bytes::Bytes;
@@ -11,13 +12,23 @@ use bytes::Bytes;
 use crate::config::{StorageBackendKind, StorageConfig};
 use crate::error::{Error, Result};
 
+#[derive(Debug, Clone)]
+pub struct StoredObject {
+    pub body: Bytes,
+    pub etag: Option<String>,
+}
+
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes>;
     async fn get_object(&self, key: &str) -> Result<Bytes>;
+    async fn get_object_with_etag(&self, key: &str) -> Result<StoredObject>;
     async fn put_bytes(&self, key: &str, body: Bytes) -> Result<()>;
+    async fn put_bytes_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<bool>;
+    async fn put_bytes_if_absent(&self, key: &str, body: Bytes) -> Result<bool>;
     async fn put_file(&self, key: &str, path: &Path) -> Result<()>;
     async fn delete_object(&self, key: &str) -> Result<()>;
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 #[derive(Clone)]
@@ -109,6 +120,10 @@ impl StorageBackend for S3CompatibleStorageBackend {
     }
 
     async fn get_object(&self, key: &str) -> Result<Bytes> {
+        Ok(self.get_object_with_etag(key).await?.body)
+    }
+
+    async fn get_object_with_etag(&self, key: &str) -> Result<StoredObject> {
         let response = self
             .client
             .get_object()
@@ -117,12 +132,16 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .send()
             .await
             .map_err(|error| self.format_error("get_object", key, None, &error))?;
+        let etag = response.e_tag().map(ToOwned::to_owned);
         let body = response
             .body
             .collect()
             .await
             .map_err(|error| self.format_error("collect_body", key, None, &error))?;
-        Ok(body.into_bytes())
+        Ok(StoredObject {
+            body: body.into_bytes(),
+            etag,
+        })
     }
 
     async fn put_bytes(&self, key: &str, body: Bytes) -> Result<()> {
@@ -135,6 +154,40 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .await
             .map_err(|error| self.format_error("put_bytes", key, None, &error))?;
         Ok(())
+    }
+
+    async fn put_bytes_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<bool> {
+        let response = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_match(etag)
+            .body(ByteStream::from(body))
+            .send()
+            .await;
+        match response {
+            Ok(_) => Ok(true),
+            Err(error) if is_conditional_write_failure(&error) => Ok(false),
+            Err(error) => Err(self.format_error("put_bytes_if_match", key, None, &error)),
+        }
+    }
+
+    async fn put_bytes_if_absent(&self, key: &str, body: Bytes) -> Result<bool> {
+        let response = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(ByteStream::from(body))
+            .send()
+            .await;
+        match response {
+            Ok(_) => Ok(true),
+            Err(error) if is_conditional_write_failure(&error) => Ok(false),
+            Err(error) => Err(self.format_error("put_bytes_if_absent", key, None, &error)),
+        }
     }
 
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
@@ -164,6 +217,43 @@ impl StorageBackend for S3CompatibleStorageBackend {
             .await
             .map_err(|error| self.format_error("delete_object", key, None, &error))?;
         Ok(())
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut continuation_token = None;
+        let mut keys = Vec::new();
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = continuation_token.clone() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|error| self.format_error("list_prefix", prefix, None, &error))?;
+
+            if let Some(contents) = response.contents {
+                for object in contents {
+                    if let Some(key) = object.key {
+                        keys.push(key);
+                    }
+                }
+            }
+
+            if response.is_truncated.unwrap_or(false) {
+                continuation_token = response.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        Ok(keys)
     }
 }
 
@@ -207,4 +297,13 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = next.source();
     }
     message
+}
+
+fn is_conditional_write_failure(
+    error: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+) -> bool {
+    error
+        .as_service_error()
+        .and_then(|inner| inner.code())
+        .is_some_and(|code| matches!(code, "PreconditionFailed" | "ConditionalRequestConflict"))
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, remove_file};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 
 use crate::cache::LocalCache;
 use crate::config::{CloneSourceConfig, ServerConfig};
@@ -18,6 +19,7 @@ use crate::manifest::{
     ChunkLocation, ChunkSource, Manifest, ReplacementChunk, chunk_len, chunk_offset,
 };
 use crate::remote::StorageBackend;
+use crate::volume::VolumeMetadata;
 
 #[derive(Clone)]
 enum ReadSource {
@@ -67,13 +69,14 @@ pub struct Status {
 pub struct SnapshotResponse {
     pub snapshot_created: bool,
     pub generation: u64,
-    pub garbage_collected_objects: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CompactResponse {
     pub generation: u64,
-    pub garbage_collected_objects: usize,
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +89,8 @@ pub struct ResetCacheResponse {
 #[derive(Debug, Serialize, Deserialize)]
 struct CurrentRef {
     generation: u64,
+    #[serde(default)]
+    snapshot_id: Option<String>,
     manifest_key: String,
 }
 
@@ -98,6 +103,12 @@ struct CloneSeedRecord {
 #[derive(Clone)]
 struct ResolvedManifest {
     manifest_key: String,
+    manifest: Manifest,
+}
+
+struct PreparedPublish {
+    generation: u64,
+    snapshot_id: String,
     manifest: Manifest,
 }
 
@@ -181,7 +192,7 @@ impl Export {
             ));
         }
         let resolved =
-            resolve_manifest(&*remote, &config.storage.prefix, config.snapshot_id).await?;
+            resolve_manifest(&*remote, &config.storage.prefix, config.snapshot_id.clone()).await?;
         let manifest = resolved.manifest;
 
         let cache = if config.cache_dir.join("cache.meta").exists() {
@@ -460,45 +471,53 @@ impl Export {
         let _snapshot_guard = self.write_gate.write().await;
         self.cache.set_snapshot_in_progress(true)?;
         self.cache.sync_data()?;
+        if self.cache.manifest_generation() != 0 && self.cache.dirty_count() == 0 {
+            self.cache.set_snapshot_in_progress(false)?;
+            return Ok(SnapshotResponse {
+                snapshot_created: false,
+                generation: self.cache.manifest_generation(),
+                snapshot_id: None,
+            });
+        }
         let next_generation = self.cache.manifest_generation() + 1;
         let read_source = self.read_source.read().await.clone();
         let published_manifest = self.published_manifest.read().await.clone();
-        let previous_keys = published_manifest
-            .as_ref()
-            .map(|manifest| manifest.referenced_object_keys());
 
         let result = if self.cache.manifest_generation() == 0 {
             match read_source.as_ref() {
                 ReadSource::Zero { .. } => {
-                    self.publish_initial_sparse_snapshot(next_generation).await
+                    self.publish_initial_sparse_snapshot(next_generation, new_snapshot_id())
+                        .await
                 }
                 ReadSource::Manifest(_) => {
                     self.materialize_all_chunks().await?;
                     self.cache.sync_data()?;
+                    let snapshot_id = new_snapshot_id();
                     self.publish_full_snapshot(
                         next_generation,
+                        snapshot_id.clone(),
                         JournalOperation::Snapshot,
                         format!(
-                            "{}/snapshots/{next_generation}/base.blob",
-                            self.config.storage.prefix
+                            "{}/snapshots/{}/base.blob",
+                            self.config.storage.prefix, snapshot_id
                         ),
-                        None,
                     )
                     .await
                 }
             }
         } else {
+            let snapshot_id = new_snapshot_id();
             self.publish_delta_snapshot(
                 next_generation,
+                snapshot_id,
                 published_manifest.ok_or_else(|| {
                     Error::InvalidManifest("missing published manifest".to_string())
                 })?,
-                previous_keys,
             )
             .await
         };
 
-        self.finish_publish(result)
+        self.finish_publish(result).await
     }
 
     async fn compact_inner(&self) -> Result<CompactResponse> {
@@ -507,29 +526,25 @@ impl Export {
         self.materialize_all_chunks().await?;
         self.cache.sync_data()?;
         let generation = self.cache.manifest_generation() + 1;
-        let previous_keys = self
-            .published_manifest
-            .read()
-            .await
-            .as_ref()
-            .map(|manifest| manifest.referenced_object_keys());
-
+        let snapshot_id = new_snapshot_id();
         let result = self
             .publish_full_snapshot(
                 generation,
+                snapshot_id.clone(),
                 JournalOperation::Compact,
                 format!(
-                    "{}/snapshots/{generation}/base.blob",
-                    self.config.storage.prefix
+                    "{}/snapshots/{}/base.blob",
+                    self.config.storage.prefix, snapshot_id
                 ),
-                previous_keys,
             )
             .await;
-        let result = self.finish_publish(result)?;
+        let result = self.finish_publish(result).await?;
 
         Ok(CompactResponse {
             generation: result.generation,
-            garbage_collected_objects: result.garbage_collected_objects,
+            snapshot_id: result.snapshot_id.ok_or_else(|| {
+                Error::InvalidRequest("compact did not publish a snapshot id".to_string())
+            })?,
         })
     }
 
@@ -543,14 +558,16 @@ impl Export {
         })
     }
 
-    fn finish_publish(&self, result: Result<SnapshotResponse>) -> Result<SnapshotResponse> {
+    async fn finish_publish(&self, result: Result<PreparedPublish>) -> Result<SnapshotResponse> {
         let clear_journal = JournalRecord::clear(&self.journal_path);
         let clear_flag = self.cache.set_snapshot_in_progress(false);
 
         match result {
-            Ok(response) => {
+            Ok(prepared) => {
+                let committed = self.commit_prepared_publish(prepared).await;
                 clear_journal?;
                 clear_flag?;
+                let response = committed?;
                 if response.snapshot_created {
                     if self.cache.manifest_generation() == 0 && response.generation == 1 {
                         remove_file(&self.clone_seed_path).ok();
@@ -571,10 +588,10 @@ impl Export {
     async fn publish_full_snapshot(
         &self,
         generation: u64,
+        snapshot_id: String,
         operation: JournalOperation,
         object_key: String,
-        previous_keys: Option<BTreeSet<String>>,
-    ) -> Result<SnapshotResponse> {
+    ) -> Result<PreparedPublish> {
         let image_size = self.cache.image_size();
         if image_size > SINGLE_PUT_LIMIT_BYTES {
             return Err(Error::InvalidRequest(format!(
@@ -583,7 +600,7 @@ impl Export {
             )));
         }
 
-        let manifest_key = manifest_key(&self.config.storage.prefix, generation);
+        let manifest_key = manifest_key(&self.config.storage.prefix, &snapshot_id);
         JournalRecord {
             version: 1,
             operation: operation.clone(),
@@ -617,20 +634,20 @@ impl Export {
             self.cache.chunk_size(),
             object_key,
         )?;
-        let gc = self.publish_manifest(manifest, previous_keys).await?;
-        Ok(SnapshotResponse {
-            snapshot_created: true,
-            generation,
-            garbage_collected_objects: gc,
-        })
+        self.stage_manifest(snapshot_id, manifest).await
     }
 
-    async fn publish_initial_sparse_snapshot(&self, generation: u64) -> Result<SnapshotResponse> {
+    async fn publish_initial_sparse_snapshot(
+        &self,
+        generation: u64,
+        snapshot_id: String,
+    ) -> Result<PreparedPublish> {
         let dirty = self.cache.dirty_indices();
         if dirty.is_empty() {
             tracing::info!(
                 generation,
                 image_size = self.cache.image_size(),
+                snapshot_id = %snapshot_id,
                 "publishing initial zero-backed manifest without data objects"
             );
             let manifest = Manifest::empty(
@@ -639,23 +656,18 @@ impl Export {
                 self.cache.image_size(),
                 self.cache.chunk_size(),
             )?;
-            let gc = self.publish_manifest(manifest, None).await?;
-            return Ok(SnapshotResponse {
-                snapshot_created: true,
-                generation,
-                garbage_collected_objects: gc,
-            });
+            return self.stage_manifest(snapshot_id, manifest).await;
         }
 
         let delta_path = self
             .config
             .cache_dir
-            .join(format!("snapshot-{generation}.delta.blob"));
+            .join(format!("snapshot-{snapshot_id}.delta.blob"));
         let delta_key = format!(
-            "{}/snapshots/{generation}/delta.blob",
-            self.config.storage.prefix
+            "{}/snapshots/{}/delta.blob",
+            self.config.storage.prefix, snapshot_id
         );
-        let manifest_key = manifest_key(&self.config.storage.prefix, generation);
+        let manifest_key = manifest_key(&self.config.storage.prefix, &snapshot_id);
 
         let mut delta_file = OpenOptions::new()
             .create(true)
@@ -721,40 +733,26 @@ impl Export {
             self.cache.chunk_size(),
         )?
         .with_new_ref(generation, delta_key, replacements)?;
-        let gc = self.publish_manifest(manifest, None).await?;
         remove_file(&delta_path).ok();
-
-        Ok(SnapshotResponse {
-            snapshot_created: true,
-            generation,
-            garbage_collected_objects: gc,
-        })
+        self.stage_manifest(snapshot_id, manifest).await
     }
 
     async fn publish_delta_snapshot(
         &self,
         generation: u64,
+        snapshot_id: String,
         published_manifest: Manifest,
-        previous_keys: Option<BTreeSet<String>>,
-    ) -> Result<SnapshotResponse> {
+    ) -> Result<PreparedPublish> {
         let dirty = self.cache.dirty_indices();
-        if dirty.is_empty() {
-            return Ok(SnapshotResponse {
-                snapshot_created: false,
-                generation: self.cache.manifest_generation(),
-                garbage_collected_objects: 0,
-            });
-        }
-
         let delta_path = self
             .config
             .cache_dir
-            .join(format!("snapshot-{generation}.delta.blob"));
+            .join(format!("snapshot-{snapshot_id}.delta.blob"));
         let delta_key = format!(
-            "{}/snapshots/{generation}/delta.blob",
-            self.config.storage.prefix
+            "{}/snapshots/{}/delta.blob",
+            self.config.storage.prefix, snapshot_id
         );
-        let manifest_key = manifest_key(&self.config.storage.prefix, generation);
+        let manifest_key = manifest_key(&self.config.storage.prefix, &snapshot_id);
 
         let mut delta_file = OpenOptions::new()
             .create(true)
@@ -813,22 +811,16 @@ impl Export {
             "finished delta snapshot upload"
         );
         let manifest = published_manifest.with_new_ref(generation, delta_key, replacements)?;
-        let gc = self.publish_manifest(manifest, previous_keys).await?;
         remove_file(&delta_path).ok();
-
-        Ok(SnapshotResponse {
-            snapshot_created: true,
-            generation,
-            garbage_collected_objects: gc,
-        })
+        self.stage_manifest(snapshot_id, manifest).await
     }
 
-    async fn publish_manifest(
+    async fn stage_manifest(
         &self,
+        snapshot_id: String,
         manifest: Manifest,
-        previous_keys: Option<BTreeSet<String>>,
-    ) -> Result<usize> {
-        let manifest_key = manifest_key(&self.config.storage.prefix, manifest.generation);
+    ) -> Result<PreparedPublish> {
+        let manifest_key = manifest_key(&self.config.storage.prefix, &snapshot_id);
         self.remote
             .put_bytes(
                 &manifest_key,
@@ -836,41 +828,60 @@ impl Export {
             )
             .await?;
 
+        Ok(PreparedPublish {
+            generation: manifest.generation,
+            snapshot_id,
+            manifest,
+        })
+    }
+
+    async fn commit_prepared_publish(&self, prepared: PreparedPublish) -> Result<SnapshotResponse> {
+        let manifest_key = manifest_key(&self.config.storage.prefix, &prepared.snapshot_id);
+        if let Some(volume_key) = &self.config.volume_key {
+            let stored = self.remote.get_object_with_etag(volume_key).await?;
+            let current: VolumeMetadata = serde_json::from_slice(&stored.body)?;
+            current.validate()?;
+            let next = current.with_current_snapshot_id(prepared.snapshot_id.clone());
+            let etag = stored.etag.ok_or_else(|| {
+                Error::InvalidRequest(format!(
+                    "volume metadata {} is missing an etag; conditional publish is unavailable",
+                    volume_key
+                ))
+            })?;
+            let updated = self
+                .remote
+                .put_bytes_if_match(
+                    volume_key,
+                    Bytes::from(serde_json::to_vec_pretty(&next)?),
+                    &etag,
+                )
+                .await?;
+            if !updated {
+                return Err(Error::Conflict(format!(
+                    "volume head changed while publishing snapshot {} for export {}",
+                    prepared.snapshot_id, self.config.export_id
+                )));
+            }
+        }
+
         self.remote
             .put_bytes(
                 &current_ref_key(&self.config.storage.prefix),
                 Bytes::from(serde_json::to_vec_pretty(&CurrentRef {
-                    generation: manifest.generation,
+                    generation: prepared.manifest.generation,
+                    snapshot_id: Some(prepared.snapshot_id.clone()),
                     manifest_key: manifest_key.clone(),
                 })?),
             )
             .await?;
 
-        let new_keys = manifest.referenced_object_keys();
-        *self.read_source.write().await = Arc::new(ReadSource::Manifest(manifest.clone()));
-        *self.published_manifest.write().await = Some(manifest);
-        Ok(self
-            .garbage_collect_unreferenced_objects(previous_keys, &new_keys)
-            .await)
-    }
-
-    async fn garbage_collect_unreferenced_objects(
-        &self,
-        previous_keys: Option<BTreeSet<String>>,
-        current_keys: &BTreeSet<String>,
-    ) -> usize {
-        let Some(previous_keys) = previous_keys else {
-            return 0;
-        };
-
-        let mut deleted = 0;
-        for key in previous_keys.difference(current_keys) {
-            match self.remote.delete_object(key).await {
-                Ok(()) => deleted += 1,
-                Err(error) => tracing::warn!("failed to delete stale object {key}: {error}"),
-            }
-        }
-        deleted
+        *self.read_source.write().await = Arc::new(ReadSource::Manifest(prepared.manifest.clone()));
+        *self.published_manifest.write().await = Some(prepared.manifest);
+        Ok(SnapshotResponse {
+            snapshot_created: true,
+            generation: prepared.generation,
+            snapshot_id: Some(prepared.snapshot_id),
+        })
     }
 
     async fn materialize_all_chunks(&self) -> Result<()> {
@@ -968,10 +979,10 @@ impl CloneSeedRecord {
 async fn resolve_manifest(
     remote: &dyn StorageBackend,
     prefix: &str,
-    snapshot_id: Option<u64>,
+    snapshot_id: Option<String>,
 ) -> Result<ResolvedManifest> {
     let manifest_key = if let Some(snapshot_id) = snapshot_id {
-        manifest_key(prefix, snapshot_id)
+        manifest_key(prefix, &snapshot_id)
     } else {
         let current_ref: CurrentRef =
             serde_json::from_slice(&remote.get_object(&current_ref_key(prefix)).await?)?;
@@ -984,7 +995,12 @@ async fn resolve_manifest_for_clone(
     remote: &dyn StorageBackend,
     clone_source: &CloneSourceConfig,
 ) -> Result<ResolvedManifest> {
-    resolve_manifest(remote, &clone_source.prefix, clone_source.snapshot_id).await
+    resolve_manifest(
+        remote,
+        &clone_source.prefix,
+        clone_source.snapshot_id.clone(),
+    )
+    .await
 }
 
 async fn resolve_manifest_by_key(
@@ -1003,8 +1019,12 @@ fn current_ref_key(prefix: &str) -> String {
     format!("{prefix}/refs/current.json")
 }
 
-fn manifest_key(prefix: &str, generation: u64) -> String {
-    format!("{prefix}/snapshots/{generation}/manifest.json")
+fn manifest_key(prefix: &str, snapshot_id: &str) -> String {
+    format!("{prefix}/snapshots/{snapshot_id}/manifest.json")
+}
+
+fn new_snapshot_id() -> String {
+    Uuid::now_v7().simple().to_string()
 }
 
 #[cfg(test)]
@@ -1023,45 +1043,125 @@ mod tests {
 
     use super::Export;
 
+    #[derive(Clone)]
+    struct MemoryObject {
+        body: Vec<u8>,
+        etag: String,
+    }
+
     #[derive(Default)]
     struct MemoryRemote {
-        objects: Mutex<HashMap<String, Vec<u8>>>,
-        deleted: Mutex<Vec<String>>,
+        objects: Mutex<HashMap<String, MemoryObject>>,
+        next_etag: Mutex<u64>,
     }
 
     #[async_trait]
     impl StorageBackend for MemoryRemote {
         async fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::Result<Bytes> {
             let objects = self.objects.lock().unwrap();
-            let bytes = objects.get(key).unwrap();
+            let bytes = &objects.get(key).unwrap().body;
             Ok(Bytes::copy_from_slice(
                 &bytes[offset as usize..(offset + len) as usize],
             ))
         }
 
         async fn get_object(&self, key: &str) -> crate::Result<Bytes> {
+            Ok(self.get_object_with_etag(key).await?.body)
+        }
+
+        async fn get_object_with_etag(
+            &self,
+            key: &str,
+        ) -> crate::Result<crate::remote::StoredObject> {
             let objects = self.objects.lock().unwrap();
-            Ok(Bytes::copy_from_slice(objects.get(key).unwrap()))
+            let object = objects.get(key).unwrap();
+            Ok(crate::remote::StoredObject {
+                body: Bytes::copy_from_slice(&object.body),
+                etag: Some(object.etag.clone()),
+            })
         }
 
         async fn put_bytes(&self, key: &str, body: Bytes) -> crate::Result<()> {
-            self.objects
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), body.to_vec());
+            self.put_object(key, body.to_vec());
             Ok(())
+        }
+
+        async fn put_bytes_if_match(
+            &self,
+            key: &str,
+            body: Bytes,
+            etag: &str,
+        ) -> crate::Result<bool> {
+            let mut objects = self.objects.lock().unwrap();
+            let Some(current) = objects.get(key) else {
+                return Ok(false);
+            };
+            if current.etag != etag {
+                return Ok(false);
+            }
+            let next_etag = self.allocate_etag();
+            objects.insert(
+                key.to_string(),
+                MemoryObject {
+                    body: body.to_vec(),
+                    etag: next_etag,
+                },
+            );
+            Ok(true)
+        }
+
+        async fn put_bytes_if_absent(&self, key: &str, body: Bytes) -> crate::Result<bool> {
+            let mut objects = self.objects.lock().unwrap();
+            if objects.contains_key(key) {
+                return Ok(false);
+            }
+            let next_etag = self.allocate_etag();
+            objects.insert(
+                key.to_string(),
+                MemoryObject {
+                    body: body.to_vec(),
+                    etag: next_etag,
+                },
+            );
+            Ok(true)
         }
 
         async fn put_file(&self, key: &str, path: &Path) -> crate::Result<()> {
             let bytes = std::fs::read(path)?;
-            self.objects.lock().unwrap().insert(key.to_string(), bytes);
+            self.put_object(key, bytes);
             Ok(())
         }
 
         async fn delete_object(&self, key: &str) -> crate::Result<()> {
             self.objects.lock().unwrap().remove(key);
-            self.deleted.lock().unwrap().push(key.to_string());
             Ok(())
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+    }
+
+    impl MemoryRemote {
+        fn put_object(&self, key: &str, body: Vec<u8>) {
+            let etag = self.allocate_etag();
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), MemoryObject { body, etag });
+        }
+
+        fn allocate_etag(&self) -> String {
+            let mut next = self.next_etag.lock().unwrap();
+            *next += 1;
+            format!("etag-{}", *next)
         }
     }
 
@@ -1083,6 +1183,7 @@ mod tests {
             snapshot_id: None,
             image_size: Some(8),
             clone_source: None,
+            volume_key: None,
         }
     }
 
@@ -1105,8 +1206,9 @@ mod tests {
             image_size: None,
             clone_source: Some(crate::config::CloneSourceConfig {
                 prefix: "exports/export".to_string(),
-                snapshot_id: Some(2),
+                snapshot_id: Some("2".to_string()),
             }),
+            volume_key: None,
         }
     }
 
@@ -1171,9 +1273,12 @@ mod tests {
         export.write(4, b"wxyz", false).await.unwrap();
         let second = export.snapshot().await.unwrap();
         assert_eq!(second.generation, 2);
+        let second_snapshot_id = second.snapshot_id.as_deref().unwrap();
 
         let manifest = remote
-            .get_object("exports/export/snapshots/2/manifest.json")
+            .get_object(&format!(
+                "exports/export/snapshots/{second_snapshot_id}/manifest.json"
+            ))
             .await
             .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
@@ -1249,7 +1354,7 @@ mod tests {
             .unwrap();
 
         let mut config = base_config(dir.path());
-        config.snapshot_id = Some(1);
+        config.snapshot_id = Some("1".to_string());
         let export = Export::open(config, remote).await.unwrap();
 
         let status = export.status().await;
@@ -1338,13 +1443,16 @@ mod tests {
 
         let snapshot = clone.snapshot().await.unwrap();
         assert_eq!(snapshot.generation, 1);
+        let snapshot_id = snapshot.snapshot_id.as_deref().unwrap();
 
         let status = clone.status().await;
         assert_eq!(status.snapshot_generation, 1);
         assert_eq!(status.remote_head_generation, 1);
 
         let manifest = remote
-            .get_object("exports/clone/snapshots/1/manifest.json")
+            .get_object(&format!(
+                "exports/clone/snapshots/{snapshot_id}/manifest.json"
+            ))
             .await
             .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
@@ -1352,11 +1460,11 @@ mod tests {
         assert_eq!(manifest["base_ref"], 1);
         assert_eq!(
             manifest["refs"][0]["path"],
-            "exports/clone/snapshots/1/base.blob"
+            format!("exports/clone/snapshots/{snapshot_id}/base.blob")
         );
         assert_eq!(
             remote
-                .get_object("exports/clone/snapshots/1/base.blob")
+                .get_object(&format!("exports/clone/snapshots/{snapshot_id}/base.blob"))
                 .await
                 .unwrap(),
             Bytes::from_static(b"WXYZefgh")
@@ -1429,14 +1537,14 @@ mod tests {
             .unwrap();
 
         let mut first_config = base_config(dir.path());
-        first_config.snapshot_id = Some(1);
+        first_config.snapshot_id = Some("1".to_string());
         let first = Export::open(first_config, remote.clone()).await.unwrap();
         assert_eq!(first.read(0, 8).await.unwrap(), b"abcdefgh");
         first.shutdown().unwrap();
         drop(first);
 
         let mut second_config = base_config(dir.path());
-        second_config.snapshot_id = Some(2);
+        second_config.snapshot_id = Some("2".to_string());
         let second = Export::open(second_config, remote).await.unwrap();
         assert_eq!(second.read(0, 8).await.unwrap(), b"wxyz1234");
     }
@@ -1501,14 +1609,14 @@ mod tests {
             .unwrap();
 
         let mut first_config = base_config(dir.path());
-        first_config.snapshot_id = Some(1);
+        first_config.snapshot_id = Some("1".to_string());
         let first = Export::open(first_config, remote.clone()).await.unwrap();
         first.write(0, b"ZZZZ", false).await.unwrap();
         first.shutdown().unwrap();
         drop(first);
 
         let mut second_config = base_config(dir.path());
-        second_config.snapshot_id = Some(2);
+        second_config.snapshot_id = Some("2".to_string());
         let error = match Export::open(second_config, remote).await {
             Ok(_) => panic!("expected snapshot switch with dirty cache to fail"),
             Err(error) => error,
@@ -1576,7 +1684,7 @@ mod tests {
             .unwrap();
 
         let mut first_config = base_config(dir.path());
-        first_config.snapshot_id = Some(1);
+        first_config.snapshot_id = Some("1".to_string());
         let first = Export::open(first_config, remote.clone()).await.unwrap();
         assert_eq!(first.read(0, 8).await.unwrap(), b"abcdefgh");
         first.write(0, b"ZZZZ", false).await.unwrap();
@@ -1593,7 +1701,7 @@ mod tests {
         drop(first);
 
         let mut second_config = base_config(dir.path());
-        second_config.snapshot_id = Some(2);
+        second_config.snapshot_id = Some("2".to_string());
         let second = Export::open(second_config, remote).await.unwrap();
         assert_eq!(second.read(0, 8).await.unwrap(), b"wxyz1234");
     }
@@ -1609,9 +1717,12 @@ mod tests {
         export.write(0, b"abcd", false).await.unwrap();
         let first = export.snapshot().await.unwrap();
         assert_eq!(first.generation, 1);
+        let first_snapshot_id = first.snapshot_id.as_deref().unwrap();
 
         let manifest = remote
-            .get_object("exports/export/snapshots/1/manifest.json")
+            .get_object(&format!(
+                "exports/export/snapshots/{first_snapshot_id}/manifest.json"
+            ))
             .await
             .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
@@ -1625,17 +1736,13 @@ mod tests {
                 .unwrap()
                 .contains_key("exports/export/base/full.blob")
         );
-        assert!(
-            remote
-                .objects
-                .lock()
-                .unwrap()
-                .contains_key("exports/export/snapshots/1/delta.blob")
-        );
+        assert!(remote.objects.lock().unwrap().contains_key(&format!(
+            "exports/export/snapshots/{first_snapshot_id}/delta.blob"
+        )));
     }
 
     #[tokio::test]
-    async fn compact_rewrites_full_base_and_collects_old_delta() {
+    async fn compact_rewrites_full_base_without_deleting_older_snapshots() {
         let dir = tempdir().unwrap();
         let remote = Arc::new(MemoryRemote::default());
         let export = Export::create(base_config(dir.path()), remote.clone())
@@ -1645,25 +1752,18 @@ mod tests {
         export.write(0, b"abcd", false).await.unwrap();
         export.snapshot().await.unwrap();
         export.write(4, b"wxyz", false).await.unwrap();
-        export.snapshot().await.unwrap();
+        let second = export.snapshot().await.unwrap();
 
         let compact = export.compact().await.unwrap();
         assert_eq!(compact.generation, 3);
-        assert!(
-            remote
-                .deleted
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|key| key == "exports/export/snapshots/1/delta.blob")
-        );
-        assert!(
-            remote
-                .objects
-                .lock()
-                .unwrap()
-                .contains_key("exports/export/snapshots/3/base.blob")
-        );
+        let second_snapshot_id = second.snapshot_id.as_deref().unwrap();
+        let compact_snapshot_id = compact.snapshot_id.as_str();
+        assert!(remote.objects.lock().unwrap().contains_key(&format!(
+            "exports/export/snapshots/{second_snapshot_id}/delta.blob"
+        )));
+        assert!(remote.objects.lock().unwrap().contains_key(&format!(
+            "exports/export/snapshots/{compact_snapshot_id}/base.blob"
+        )));
     }
 
     #[tokio::test]

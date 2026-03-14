@@ -1,6 +1,6 @@
 # nbd-server
 
-`nbd-server` is a single-export Rust NBD server with a lazy local cache and a pluggable object-storage backend.
+`nbd-server` is a Rust NBD server with a lazy local cache and a pluggable object-storage backend. The primary workflow is a long-running `serve` process that discovers and manages multiple exports through an HTTP API.
 
 ## Model
 
@@ -13,7 +13,8 @@
   - for a brand-new export, the first publish writes a sparse manifest with no `base_ref` and uploads only dirty chunks into one data blob
   - later publishes upload one packed delta blob containing only dirty chunks
   - each publish writes a complete human-readable `manifest.json`
-- `COMPACT` rewrites the entire current image into a fresh base object and garbage-collects unreferenced remote data objects.
+- `COMPACT` rewrites the entire current image into a fresh base object.
+- Published snapshots are retained until explicitly deleted by the user.
 
 ## Build
 
@@ -21,102 +22,54 @@
 cargo build
 ```
 
-## Create A New Export
+## Serve Mode
 
-### AWS S3
+Start the multi-export server with a global cache root and export root. On startup it discovers existing `volume.json` files from object storage and loads those exports automatically.
 
 ```bash
-cargo run -- create \
-  --export-id vm-001 \
-  --size 1073741824 \
-  --cache-dir /var/lib/nbd-server/vm-001 \
+cargo run -- serve \
+  --cache-root /var/lib/nbd-server \
+  --export-root exports \
   --bucket my-bucket \
-  --prefix exports/vm-001 \
   --listen 127.0.0.1:10809 \
-  --admin-sock /tmp/nbd-server-vm-001.sock
+  --admin-sock /tmp/nbd-server.sock
 ```
 
-### Cloudflare R2
+In `serve` mode:
 
-Use your R2 access key pair through the normal AWS credential environment variables:
+- local cache directories are derived as `<cache-root>/<export_id>`
+- remote export prefixes are derived as `<export-root>/<export_id>`
+- the NBD listener can negotiate any currently loaded export name
+- `volume.json` is the authoritative remote head for each export
+
+## Manage Exports Through The API
+
+The server-level storage configuration is provided once at `serve` startup. Export-management requests only carry logical identifiers such as `export_id` and `source_export_id`.
+
+For `export_id = vm-001`:
+
+- local cache dir is `/var/lib/nbd-server/vm-001`
+- remote prefix is `exports/vm-001`
+
+The client never supplies those derived paths in the request body.
+
+### Credentials
+
+For S3-compatible backends such as Cloudflare R2, provide credentials through the normal AWS environment variables before starting the server:
 
 ```bash
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 ```
 
-Then run:
-
-```bash
-cargo run -- create \
-  --export-id vm-001 \
-  --size 1073741824 \
-  --cache-dir /var/lib/nbd-server/vm-001 \
-  --storage-backend r2 \
-  --bucket my-r2-bucket \
-  --prefix exports/vm-001 \
-  --region auto \
-  --r2-account-id <account-id> \
-  --listen 127.0.0.1:10809 \
-  --admin-sock /tmp/nbd-server-vm-001.sock
-```
-
-## Open An Existing Export
-
-```bash
-cargo run -- open \
-  --export-id vm-001 \
-  --cache-dir /var/lib/nbd-server/vm-001 \
-  --bucket my-bucket \
-  --prefix exports/vm-001 \
-  --listen 127.0.0.1:10809 \
-  --admin-sock /tmp/nbd-server-vm-001.sock
-```
-
-By default, `open` resolves `exports/<id>/refs/current.json`. To open a specific snapshot generation instead:
-
-```bash
-cargo run -- open \
-  --export-id vm-001 \
-  --cache-dir /var/lib/nbd-server/vm-001 \
-  --bucket my-bucket \
-  --prefix exports/vm-001 \
-  --snapshot-id 7 \
-  --listen 127.0.0.1:10809 \
-  --admin-sock /tmp/nbd-server-vm-001.sock
-```
-
-Reusing the same `--cache-dir` across generations is supported only when the local cache has no dirty chunks. If the cache still contains unsnapshotted local writes for another generation, `open` fails instead of silently mixing snapshot lineages.
-
-For R2, add:
-
-```bash
-  --storage-backend r2 \
-  --region auto \
-  --r2-account-id <account-id>
-```
-
-## Clone From Snapshot
-
-Create a new export lineage from a published remote snapshot. Before the first snapshot, reads are seeded from the source snapshot lazily. The first snapshot of the cloned export uploads a full base blob for the target export and becomes generation `1`.
-
-```bash
-cargo run -- clone \
-  --export-id vm02 \
-  --cache-dir /var/lib/nbd-server/vm02 \
-  --bucket my-bucket \
-  --prefix exports/vm02 \
-  --source-prefix exports/vm01 \
-  --source-snapshot-id 2 \
-  --listen 127.0.0.1:10810 \
-  --admin-sock /tmp/nbd-server-vm02.sock
-```
-
-Clone always resolves against a published remote snapshot. If a running `vm01` process has local dirty writes, those writes are ignored by clone.
+For R2, add `--storage-backend r2 --region auto --r2-account-id <account-id>` to the `serve` command.
 
 ## Attach With `nbd-client`
 
-The server speaks fixed-newstyle NBD and supports `OPT_GO` for a single export named exactly like `--export-id`.
+The server speaks fixed-newstyle NBD and supports `OPT_GO`.
+
+- in direct mode, there is one export named exactly like `--export-id`
+- in `serve` mode, the export name is the managed `export_id`
 
 ```bash
 sudo modprobe nbd max_part=8
@@ -133,10 +86,51 @@ sudo nbd-client -d /dev/nbd0
 
 The admin API is HTTP over a Unix domain socket.
 
+### List Exports
+
+```bash
+curl --unix-socket /tmp/nbd-server.sock http://localhost/v1/exports
+```
+
+### Create Export
+
+```bash
+curl -X POST --unix-socket /tmp/nbd-server.sock \
+  -H 'content-type: application/json' \
+  -d '{"export_id":"vm01","size":1073741824}' \
+  http://localhost/v1/exports/create
+```
+
+### Open Export
+
+```bash
+curl -X POST --unix-socket /tmp/nbd-server.sock \
+  -H 'content-type: application/json' \
+  -d '{"export_id":"vm01"}' \
+  http://localhost/v1/exports/open
+```
+
+This loads an export that already exists remotely under `exports/<export_id>/volume.json`.
+
+If the export is already loaded in the current process, `open` returns a conflict instead of creating a second in-memory instance.
+
+### Clone Export
+
+```bash
+curl -X POST --unix-socket /tmp/nbd-server.sock \
+  -H 'content-type: application/json' \
+  -d '{"export_id":"vm02","source_export_id":"vm01","source_snapshot_id":"0195938f4f7a7c8ab1d2e3f4a5b6c7d8"}' \
+  http://localhost/v1/exports/clone
+```
+
+The request body carries only logical identifiers. The server derives cache and remote paths from global `serve` configuration.
+
+Clone always resolves against a published remote snapshot. If `source_snapshot_id` is omitted, the server uses the source export's current published snapshot from `volume.json`.
+
 ### Status
 
 ```bash
-curl --unix-socket /tmp/nbd-server-vm-001.sock http://localhost/v1/status
+curl --unix-socket /tmp/nbd-server.sock http://localhost/v1/exports/vm01/status
 ```
 
 Example response:
@@ -158,15 +152,34 @@ Example response:
 ### Snapshot
 
 ```bash
-curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
-  http://localhost/v1/snapshot
+curl -X POST --unix-socket /tmp/nbd-server.sock \
+  http://localhost/v1/exports/vm01/snapshot
+```
+
+Example response:
+
+```json
+{
+  "snapshot_created": true,
+  "generation": 4,
+  "snapshot_id": "0195d4f7a7c84b8d9a4cf59d1c4c7c9e"
+}
 ```
 
 ### Compact
 
 ```bash
-curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
-  http://localhost/v1/compact
+curl -X POST --unix-socket /tmp/nbd-server.sock \
+  http://localhost/v1/exports/vm01/compact
+```
+
+Example response:
+
+```json
+{
+  "generation": 5,
+  "snapshot_id": "0195d501f1b84e7f8d9327a45aa89d10"
+}
 ```
 
 ### Reset Cache
@@ -174,16 +187,24 @@ curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
 Discard all local dirty and resident cache state for the current export. This is destructive for unsnapshotted local writes and is intended for cases where you want to abandon local changes before reopening another snapshot with the same `--cache-dir`.
 
 ```bash
-curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
-  http://localhost/v1/cache/reset
+curl -X POST --unix-socket /tmp/nbd-server.sock \
+  http://localhost/v1/exports/vm01/cache/reset
 ```
 
 ## Remote Layout
 
-- `exports/<id>/refs/current.json`
-- `exports/<id>/snapshots/<generation>/manifest.json`
-- `exports/<id>/snapshots/<generation>/delta.blob`
-- `exports/<id>/snapshots/<generation>/base.blob` for compaction output
+- `exports/<id>/volume.json`
+- `exports/<id>/refs/current.json` for direct-mode compatibility
+- `exports/<id>/snapshots/<snapshot_id>/manifest.json`
+- `exports/<id>/snapshots/<snapshot_id>/delta.blob`
+- `exports/<id>/snapshots/<snapshot_id>/base.blob` for compaction output
+
+`volume.json` stores the current published snapshot id for the export. The manifest path is inferred from that snapshot id.
+Older snapshot objects are not deleted automatically when a new snapshot or compaction is published.
+
+## Direct Single-Export Modes
+
+`create`, `open`, and `clone` still exist as compatibility commands for one-export workflows and tests. Those commands require explicit `--cache-dir`, `--prefix`, and storage flags because they bypass the multi-export manager entirely.
 
 ## Recovery
 
@@ -191,6 +212,7 @@ curl -X POST --unix-socket /tmp/nbd-server-vm-001.sock \
 - Clean resident chunks are treated as cache and may be discarded after an unclean shutdown.
 - `snapshot.journal.json` records the in-flight publish target so startup can clean up stale local staging files after a crash.
 - Incomplete remote uploads are tolerated conservatively: the journal is cleared locally, dirty bits remain set, and a later snapshot can republish the data.
+- In `serve` mode, server restart reconstructs the in-memory export registry by scanning remote `volume.json` objects under the configured export root.
 
 ## Tests
 

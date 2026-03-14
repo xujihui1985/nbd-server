@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
 use crate::export::Export;
+use crate::manager::ExportManager;
 
 const NBD_MAGIC: u64 = 0x4e42_444d_4147_4943;
 const NBD_IHAVEOPT: u64 = 0x4948_4156_454f_5054;
@@ -59,11 +60,35 @@ pub async fn serve_nbd(addr: std::net::SocketAddr, export: Arc<Export>) -> Resul
     }
 }
 
+pub async fn serve_nbd_manager(
+    addr: std::net::SocketAddr,
+    manager: Arc<ExportManager>,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_client_manager(stream, manager).await {
+                tracing::warn!("nbd session ended with error: {error}");
+            }
+        });
+    }
+}
+
 async fn handle_client(mut stream: TcpStream, export: Arc<Export>) -> Result<()> {
     let client_flags = send_handshake(&mut stream).await?;
     if !negotiate_options(&mut stream, export.clone(), client_flags).await? {
         return Ok(());
     }
+    transmission_phase(&mut stream, export).await
+}
+
+async fn handle_client_manager(mut stream: TcpStream, manager: Arc<ExportManager>) -> Result<()> {
+    let client_flags = send_handshake(&mut stream).await?;
+    let Some(export) = negotiate_options_manager(&mut stream, manager, client_flags).await? else {
+        return Ok(());
+    };
     transmission_phase(&mut stream, export).await
 }
 
@@ -135,6 +160,72 @@ async fn negotiate_options(
     }
 }
 
+async fn negotiate_options_manager(
+    stream: &mut TcpStream,
+    manager: Arc<ExportManager>,
+    client_flags: u32,
+) -> Result<Option<Arc<Export>>> {
+    loop {
+        let mut header = [0_u8; 16];
+        stream.read_exact(&mut header).await?;
+
+        let magic = u64::from_be_bytes(header[0..8].try_into().unwrap());
+        if magic != NBD_IHAVEOPT {
+            return Err(Error::InvalidRequest(format!(
+                "unexpected option magic {magic:#x}"
+            )));
+        }
+
+        let option = u32::from_be_bytes(header[8..12].try_into().unwrap());
+        let len = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
+        let mut payload = vec![0_u8; len];
+        stream.read_exact(&mut payload).await?;
+
+        match option {
+            NBD_OPT_EXPORT_NAME => {
+                let export_name = parse_export_name(&payload)?;
+                let export = match manager.get_export(&export_name).await {
+                    Ok(export) => export,
+                    Err(_) => {
+                        send_option_reply(stream, option, NBD_REP_ERR_UNKNOWN, &[]).await?;
+                        continue;
+                    }
+                };
+                send_export_legacy(stream, &export, client_flags).await?;
+                return Ok(Some(export));
+            }
+            NBD_OPT_GO | NBD_OPT_INFO => {
+                let go = option == NBD_OPT_GO;
+                let request = parse_info_request(&payload)?;
+                let export = match manager.get_export(&request.export_name).await {
+                    Ok(export) => export,
+                    Err(_) => {
+                        send_option_reply(stream, option, NBD_REP_ERR_UNKNOWN, &[]).await?;
+                        continue;
+                    }
+                };
+
+                let infos = requested_infos(&request);
+                for info in infos {
+                    let payload = encode_info_reply(info, &export)?;
+                    send_option_reply(stream, option, NBD_REP_INFO, &payload).await?;
+                }
+                send_option_reply(stream, option, NBD_REP_ACK, &[]).await?;
+                if go {
+                    return Ok(Some(export));
+                }
+            }
+            NBD_OPT_ABORT => {
+                send_option_reply(stream, option, NBD_REP_ACK, &[]).await?;
+                return Ok(None);
+            }
+            other => {
+                send_option_reply(stream, other, NBD_REP_ERR_UNSUP, &[]).await?;
+            }
+        }
+    }
+}
+
 async fn transmission_phase(stream: &mut TcpStream, export: Arc<Export>) -> Result<()> {
     loop {
         let mut header = [0_u8; 28];
@@ -185,14 +276,17 @@ async fn transmission_phase(stream: &mut TcpStream, export: Arc<Export>) -> Resu
 }
 
 fn validate_export_name(payload: &[u8], expected: &str) -> Result<()> {
-    let name = String::from_utf8(payload.to_vec())
-        .map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    let name = parse_export_name(payload)?;
     if name != expected {
         return Err(Error::InvalidRequest(format!(
             "unknown export {name}, expected {expected}"
         )));
     }
     Ok(())
+}
+
+fn parse_export_name(payload: &[u8]) -> Result<String> {
+    String::from_utf8(payload.to_vec()).map_err(|error| Error::InvalidRequest(error.to_string()))
 }
 
 fn encode_info_reply(info: u16, export: &Export) -> Result<Vec<u8>> {
