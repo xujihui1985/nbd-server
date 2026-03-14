@@ -16,6 +16,8 @@ pub enum Error {
     InvalidManifest(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("range out of bounds: offset={offset} len={len} size={size}")]
     OutOfBounds { offset: u64, len: u64, size: u64 },
     #[error("operation already running")]

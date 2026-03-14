@@ -20,6 +20,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-w
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tempfile = "3"
