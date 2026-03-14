@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{OpenOptions, remove_file};
-use std::io::Write;
+use std::fs::{File, OpenOptions, remove_file};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::cache::LocalCache;
-use crate::config::ServerConfig;
+use crate::config::{CloneSourceConfig, ServerConfig};
 use crate::error::{Error, Result};
 use crate::journal::{JournalOperation, JournalRecord};
 use crate::manifest::{
@@ -20,19 +20,15 @@ use crate::manifest::{
 use crate::remote::StorageBackend;
 
 #[derive(Clone)]
-enum RemoteHead {
-    Zero {
-        generation: u64,
-        image_size: u64,
-        chunk_size: u64,
-    },
+enum ReadSource {
+    Zero { image_size: u64, chunk_size: u64 },
     Manifest(Manifest),
 }
 
-impl RemoteHead {
+impl ReadSource {
     fn generation(&self) -> u64 {
         match self {
-            Self::Zero { generation, .. } => *generation,
+            Self::Zero { .. } => 0,
             Self::Manifest(manifest) => manifest.generation,
         }
     }
@@ -50,13 +46,6 @@ impl RemoteHead {
                 logical_len: chunk_len(*image_size, *chunk_size, index) as u32,
             }),
             Self::Manifest(manifest) => manifest.chunk_location(index),
-        }
-    }
-
-    fn manifest(&self) -> Option<&Manifest> {
-        match self {
-            Self::Manifest(manifest) => Some(manifest),
-            Self::Zero { .. } => None,
         }
     }
 }
@@ -100,17 +89,31 @@ struct CurrentRef {
     manifest_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloneSeedRecord {
+    version: u32,
+    source_manifest_key: String,
+}
+
+#[derive(Clone)]
+struct ResolvedManifest {
+    manifest_key: String,
+    manifest: Manifest,
+}
+
 const SINGLE_PUT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 pub struct Export {
     config: ServerConfig,
     cache: Arc<LocalCache>,
     remote: Arc<dyn StorageBackend>,
-    remote_head: RwLock<Arc<RemoteHead>>,
+    read_source: RwLock<Arc<ReadSource>>,
+    published_manifest: RwLock<Option<Manifest>>,
     write_gate: RwLock<()>,
     operation_running: AtomicBool,
     operation_name: StdMutex<Option<&'static str>>,
     journal_path: std::path::PathBuf,
+    clone_seed_path: std::path::PathBuf,
     chunk_locks: Vec<Mutex<()>>,
 }
 
@@ -122,6 +125,11 @@ impl Export {
         if config.snapshot_id.is_some() {
             return Err(Error::InvalidRequest(
                 "--snapshot-id is only valid with the open command".to_string(),
+            ));
+        }
+        if config.clone_source.is_some() {
+            return Err(Error::InvalidRequest(
+                "clone source is only valid with the clone command".to_string(),
             ));
         }
         if config.image_size.is_none() {
@@ -150,14 +158,15 @@ impl Export {
         let chunk_total = cache.chunk_count();
         Ok(Arc::new(Self {
             journal_path: config.cache_dir.join("snapshot.journal.json"),
+            clone_seed_path: config.cache_dir.join("clone.seed.json"),
             config,
             cache: Arc::new(cache),
             remote,
-            remote_head: RwLock::new(Arc::new(RemoteHead::Zero {
-                generation: 0,
+            read_source: RwLock::new(Arc::new(ReadSource::Zero {
                 image_size,
                 chunk_size,
             })),
+            published_manifest: RwLock::new(None),
             write_gate: RwLock::new(()),
             operation_running: AtomicBool::new(false),
             operation_name: StdMutex::new(None),
@@ -166,18 +175,14 @@ impl Export {
     }
 
     pub async fn open(config: ServerConfig, remote: Arc<dyn StorageBackend>) -> Result<Arc<Self>> {
-        let manifest_key = if let Some(snapshot_id) = config.snapshot_id {
-            manifest_key(&config.storage.prefix, snapshot_id)
-        } else {
-            let current_ref: CurrentRef = serde_json::from_slice(
-                &remote
-                    .get_object(&current_ref_key(&config.storage.prefix))
-                    .await?,
-            )?;
-            current_ref.manifest_key
-        };
-        let manifest: Manifest = serde_json::from_slice(&remote.get_object(&manifest_key).await?)?;
-        manifest.validate()?;
+        if config.clone_source.is_some() {
+            return Err(Error::InvalidRequest(
+                "clone source is only valid with the clone command".to_string(),
+            ));
+        }
+        let resolved =
+            resolve_manifest(&*remote, &config.storage.prefix, config.snapshot_id).await?;
+        let manifest = resolved.manifest;
 
         let cache = if config.cache_dir.join("cache.meta").exists() {
             let cache = LocalCache::open(&config.cache_dir)?;
@@ -198,15 +203,106 @@ impl Export {
         let chunk_total = cache.chunk_count();
         Ok(Arc::new(Self {
             journal_path: config.cache_dir.join("snapshot.journal.json"),
+            clone_seed_path: config.cache_dir.join("clone.seed.json"),
             config,
             cache: Arc::new(cache),
             remote,
-            remote_head: RwLock::new(Arc::new(RemoteHead::Manifest(manifest))),
+            read_source: RwLock::new(Arc::new(ReadSource::Manifest(manifest.clone()))),
+            published_manifest: RwLock::new(Some(manifest)),
             write_gate: RwLock::new(()),
             operation_running: AtomicBool::new(false),
             operation_name: StdMutex::new(None),
             chunk_locks: (0..chunk_total).map(|_| Mutex::new(())).collect(),
         }))
+    }
+
+    pub async fn clone_from_snapshot(
+        config: ServerConfig,
+        remote: Arc<dyn StorageBackend>,
+    ) -> Result<Arc<Self>> {
+        if config.snapshot_id.is_some() {
+            return Err(Error::InvalidRequest(
+                "--snapshot-id is only valid with the open command".to_string(),
+            ));
+        }
+        if config.image_size.is_some() {
+            return Err(Error::InvalidRequest(
+                "--size is not valid with the clone command".to_string(),
+            ));
+        }
+        let clone_source = config
+            .clone_source
+            .clone()
+            .ok_or_else(|| Error::InvalidRequest("missing clone source".to_string()))?;
+
+        let clone_seed_path = config.cache_dir.join("clone.seed.json");
+        let cache_exists = config.cache_dir.join("cache.meta").exists();
+        if cache_exists {
+            let cache = LocalCache::open(&config.cache_dir)?;
+            Self::recover_local_state(&config.cache_dir, &cache)?;
+            if cache.manifest_generation() != 0 {
+                return Err(Error::InvalidRequest(
+                    "clone can only be resumed before the first target snapshot; use open for an initialized export".to_string(),
+                ));
+            }
+            let seed = CloneSeedRecord::load(&clone_seed_path)?.ok_or_else(|| {
+                Error::InvalidRequest(
+                    "cache directory is missing clone.seed.json; cannot safely resume clone state"
+                        .to_string(),
+                )
+            })?;
+            let resolved = resolve_manifest_by_key(&*remote, &seed.source_manifest_key).await?;
+            cache.validate_layout(
+                &config.export_id,
+                resolved.manifest.image_size,
+                resolved.manifest.chunk_size,
+            )?;
+            cache.set_clean_shutdown(false)?;
+            let chunk_total = cache.chunk_count();
+            return Ok(Arc::new(Self {
+                journal_path: config.cache_dir.join("snapshot.journal.json"),
+                clone_seed_path,
+                config,
+                cache: Arc::new(cache),
+                remote,
+                read_source: RwLock::new(Arc::new(ReadSource::Manifest(resolved.manifest))),
+                published_manifest: RwLock::new(None),
+                write_gate: RwLock::new(()),
+                operation_running: AtomicBool::new(false),
+                operation_name: StdMutex::new(None),
+                chunk_locks: (0..chunk_total).map(|_| Mutex::new(())).collect(),
+            }));
+        } else {
+            let resolved = resolve_manifest_for_clone(&*remote, &clone_source).await?;
+            CloneSeedRecord {
+                version: 1,
+                source_manifest_key: resolved.manifest_key.clone(),
+            }
+            .persist(&clone_seed_path)?;
+            let cache = LocalCache::create(
+                &config.cache_dir,
+                config.export_id.clone(),
+                resolved.manifest.image_size,
+                resolved.manifest.chunk_size,
+            )?;
+            Self::recover_local_state(&config.cache_dir, &cache)?;
+            cache.set_clean_shutdown(false)?;
+
+            let chunk_total = cache.chunk_count();
+            return Ok(Arc::new(Self {
+                journal_path: config.cache_dir.join("snapshot.journal.json"),
+                clone_seed_path,
+                config,
+                cache: Arc::new(cache),
+                remote,
+                read_source: RwLock::new(Arc::new(ReadSource::Manifest(resolved.manifest))),
+                published_manifest: RwLock::new(None),
+                write_gate: RwLock::new(()),
+                operation_running: AtomicBool::new(false),
+                operation_name: StdMutex::new(None),
+                chunk_locks: (0..chunk_total).map(|_| Mutex::new(())).collect(),
+            }));
+        }
     }
 
     pub fn image_size(&self) -> u64 {
@@ -318,7 +414,7 @@ impl Export {
     }
 
     pub async fn status(&self) -> Status {
-        let remote_head = self.remote_head.read().await;
+        let read_source = self.read_source.read().await;
         let operation_state = self
             .operation_name
             .lock()
@@ -334,7 +430,7 @@ impl Export {
             resident_chunks: self.cache.resident_count(),
             dirty_chunks: self.cache.dirty_count(),
             snapshot_generation: self.cache.manifest_generation(),
-            remote_head_generation: remote_head.generation(),
+            remote_head_generation: read_source.generation(),
             operation_state,
         }
     }
@@ -364,17 +460,42 @@ impl Export {
         let _snapshot_guard = self.write_gate.write().await;
         self.cache.set_snapshot_in_progress(true)?;
         self.cache.sync_data()?;
-        let remote_head = self.remote_head.read().await.clone();
-        let next_generation = remote_head.generation() + 1;
-        let previous_keys = remote_head
-            .manifest()
+        let next_generation = self.cache.manifest_generation() + 1;
+        let read_source = self.read_source.read().await.clone();
+        let published_manifest = self.published_manifest.read().await.clone();
+        let previous_keys = published_manifest
+            .as_ref()
             .map(|manifest| manifest.referenced_object_keys());
 
-        let result = if remote_head.generation() == 0 {
-            self.publish_initial_sparse_snapshot(next_generation).await
+        let result = if self.cache.manifest_generation() == 0 {
+            match read_source.as_ref() {
+                ReadSource::Zero { .. } => {
+                    self.publish_initial_sparse_snapshot(next_generation).await
+                }
+                ReadSource::Manifest(_) => {
+                    self.materialize_all_chunks().await?;
+                    self.cache.sync_data()?;
+                    self.publish_full_snapshot(
+                        next_generation,
+                        JournalOperation::Snapshot,
+                        format!(
+                            "{}/snapshots/{next_generation}/base.blob",
+                            self.config.storage.prefix
+                        ),
+                        None,
+                    )
+                    .await
+                }
+            }
         } else {
-            self.publish_delta_snapshot(next_generation, remote_head, previous_keys)
-                .await
+            self.publish_delta_snapshot(
+                next_generation,
+                published_manifest.ok_or_else(|| {
+                    Error::InvalidManifest("missing published manifest".to_string())
+                })?,
+                previous_keys,
+            )
+            .await
         };
 
         self.finish_publish(result)
@@ -385,10 +506,12 @@ impl Export {
         self.cache.set_snapshot_in_progress(true)?;
         self.materialize_all_chunks().await?;
         self.cache.sync_data()?;
-        let remote_head = self.remote_head.read().await.clone();
-        let generation = remote_head.generation() + 1;
-        let previous_keys = remote_head
-            .manifest()
+        let generation = self.cache.manifest_generation() + 1;
+        let previous_keys = self
+            .published_manifest
+            .read()
+            .await
+            .as_ref()
             .map(|manifest| manifest.referenced_object_keys());
 
         let result = self
@@ -429,6 +552,9 @@ impl Export {
                 clear_journal?;
                 clear_flag?;
                 if response.snapshot_created {
+                    if self.cache.manifest_generation() == 0 && response.generation == 1 {
+                        remove_file(&self.clone_seed_path).ok();
+                    }
                     self.cache.set_manifest_generation(response.generation)?;
                     self.cache.clear_dirty_all()?;
                 }
@@ -608,14 +734,14 @@ impl Export {
     async fn publish_delta_snapshot(
         &self,
         generation: u64,
-        remote_head: Arc<RemoteHead>,
+        published_manifest: Manifest,
         previous_keys: Option<BTreeSet<String>>,
     ) -> Result<SnapshotResponse> {
         let dirty = self.cache.dirty_indices();
         if dirty.is_empty() {
             return Ok(SnapshotResponse {
                 snapshot_created: false,
-                generation: remote_head.generation(),
+                generation: self.cache.manifest_generation(),
                 garbage_collected_objects: 0,
             });
         }
@@ -686,10 +812,7 @@ impl Export {
             object_key = %delta_key,
             "finished delta snapshot upload"
         );
-        let manifest = remote_head
-            .manifest()
-            .ok_or_else(|| Error::InvalidManifest("missing remote manifest".to_string()))?
-            .with_new_ref(generation, delta_key, replacements)?;
+        let manifest = published_manifest.with_new_ref(generation, delta_key, replacements)?;
         let gc = self.publish_manifest(manifest, previous_keys).await?;
         remove_file(&delta_path).ok();
 
@@ -724,7 +847,8 @@ impl Export {
             .await?;
 
         let new_keys = manifest.referenced_object_keys();
-        *self.remote_head.write().await = Arc::new(RemoteHead::Manifest(manifest));
+        *self.read_source.write().await = Arc::new(ReadSource::Manifest(manifest.clone()));
+        *self.published_manifest.write().await = Some(manifest);
         Ok(self
             .garbage_collect_unreferenced_objects(previous_keys, &new_keys)
             .await)
@@ -779,8 +903,8 @@ impl Export {
     }
 
     async fn fetch_chunk_bytes(&self, index: u64) -> Result<Vec<u8>> {
-        let remote_head = self.remote_head.read().await.clone();
-        let location = remote_head.chunk_location(index)?;
+        let read_source = self.read_source.read().await.clone();
+        let location = read_source.chunk_location(index)?;
         match location.source {
             ChunkSource::Zero => Ok(vec![0_u8; location.logical_len as usize]),
             ChunkSource::Ref => Ok(self
@@ -818,6 +942,61 @@ impl Export {
         }
         Ok(())
     }
+}
+
+impl CloneSeedRecord {
+    fn load(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    fn persist(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(path)?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+async fn resolve_manifest(
+    remote: &dyn StorageBackend,
+    prefix: &str,
+    snapshot_id: Option<u64>,
+) -> Result<ResolvedManifest> {
+    let manifest_key = if let Some(snapshot_id) = snapshot_id {
+        manifest_key(prefix, snapshot_id)
+    } else {
+        let current_ref: CurrentRef =
+            serde_json::from_slice(&remote.get_object(&current_ref_key(prefix)).await?)?;
+        current_ref.manifest_key
+    };
+    resolve_manifest_by_key(remote, &manifest_key).await
+}
+
+async fn resolve_manifest_for_clone(
+    remote: &dyn StorageBackend,
+    clone_source: &CloneSourceConfig,
+) -> Result<ResolvedManifest> {
+    resolve_manifest(remote, &clone_source.prefix, clone_source.snapshot_id).await
+}
+
+async fn resolve_manifest_by_key(
+    remote: &dyn StorageBackend,
+    manifest_key: &str,
+) -> Result<ResolvedManifest> {
+    let manifest: Manifest = serde_json::from_slice(&remote.get_object(manifest_key).await?)?;
+    manifest.validate()?;
+    Ok(ResolvedManifest {
+        manifest_key: manifest_key.to_string(),
+        manifest,
+    })
 }
 
 fn current_ref_key(prefix: &str) -> String {
@@ -903,6 +1082,31 @@ mod tests {
             chunk_size: 4,
             snapshot_id: None,
             image_size: Some(8),
+            clone_source: None,
+        }
+    }
+
+    fn clone_config(dir: &Path) -> ServerConfig {
+        ServerConfig {
+            export_id: "clone".to_string(),
+            cache_dir: dir.join("clone-cache"),
+            storage: crate::config::StorageConfig {
+                backend: crate::config::StorageBackendKind::S3,
+                bucket: "bucket".to_string(),
+                prefix: "exports/clone".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint_url: None,
+                r2_account_id: None,
+            },
+            listen: "127.0.0.1:10810".parse().unwrap(),
+            admin_sock: dir.join("clone-admin.sock"),
+            chunk_size: 4,
+            snapshot_id: None,
+            image_size: None,
+            clone_source: Some(crate::config::CloneSourceConfig {
+                prefix: "exports/export".to_string(),
+                snapshot_id: Some(2),
+            }),
         }
     }
 
@@ -1051,6 +1255,118 @@ mod tests {
         let status = export.status().await;
         assert_eq!(status.remote_head_generation, 1);
         assert_eq!(export.read(0, 8).await.unwrap(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn clone_reads_from_source_snapshot_and_starts_at_generation_zero() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        remote
+            .put_bytes(
+                "exports/export/base/full.blob",
+                Bytes::from_static(b"abcdefgh"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/2/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":2,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/full.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let clone = Export::clone_from_snapshot(clone_config(dir.path()), remote)
+            .await
+            .unwrap();
+
+        let status = clone.status().await;
+        assert_eq!(status.snapshot_generation, 0);
+        assert_eq!(status.remote_head_generation, 2);
+        assert_eq!(clone.read(0, 8).await.unwrap(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn first_clone_snapshot_uploads_full_base_blob_and_cuts_over_to_target_lineage() {
+        let dir = tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        remote
+            .put_bytes(
+                "exports/export/base/full.blob",
+                Bytes::from_static(b"abcdefgh"),
+            )
+            .await
+            .unwrap();
+        remote
+            .put_bytes(
+                "exports/export/snapshots/2/manifest.json",
+                Bytes::from_static(
+                    br#"{
+                    "version":2,
+                    "export_id":"export",
+                    "generation":2,
+                    "image_size":8,
+                    "chunk_size":4,
+                    "chunk_count":2,
+                    "created_at":"2026-03-07T00:00:00Z",
+                    "base_ref":1,
+                    "refs":[{"id":1,"path":"exports/export/base/full.blob"}],
+                    "entries":[]
+                }"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let clone = Export::clone_from_snapshot(clone_config(dir.path()), remote.clone())
+            .await
+            .unwrap();
+        clone.write(0, b"WXYZ", false).await.unwrap();
+
+        let snapshot = clone.snapshot().await.unwrap();
+        assert_eq!(snapshot.generation, 1);
+
+        let status = clone.status().await;
+        assert_eq!(status.snapshot_generation, 1);
+        assert_eq!(status.remote_head_generation, 1);
+
+        let manifest = remote
+            .get_object("exports/clone/snapshots/1/manifest.json")
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(manifest["generation"], 1);
+        assert_eq!(manifest["base_ref"], 1);
+        assert_eq!(
+            manifest["refs"][0]["path"],
+            "exports/clone/snapshots/1/base.blob"
+        );
+        assert_eq!(
+            remote
+                .get_object("exports/clone/snapshots/1/base.blob")
+                .await
+                .unwrap(),
+            Bytes::from_static(b"WXYZefgh")
+        );
+        assert!(
+            !dir.path()
+                .join("clone-cache")
+                .join("clone.seed.json")
+                .exists()
+        );
     }
 
     #[tokio::test]

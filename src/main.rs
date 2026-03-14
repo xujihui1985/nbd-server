@@ -4,6 +4,12 @@ use nbd_server::config::ServerConfig;
 use nbd_server::remote::build_storage_backend;
 use nbd_server::{Cli, Commands};
 
+enum StartupMode {
+    Create,
+    Open,
+    Clone,
+}
+
 #[tokio::main]
 async fn main() -> nbd_server::Result<()> {
     tracing_subscriber::fmt()
@@ -13,16 +19,19 @@ async fn main() -> nbd_server::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let (config, create_mode) = match cli.command {
-        Commands::Create(args) => (ServerConfig::from(args), true),
-        Commands::Open(args) => (ServerConfig::from(args), false),
+    let (config, mode) = match cli.command {
+        Commands::Create(args) => (ServerConfig::from(args), StartupMode::Create),
+        Commands::Open(args) => (ServerConfig::from(args), StartupMode::Open),
+        Commands::Clone(args) => (ServerConfig::from(args), StartupMode::Clone),
     };
 
     let remote = build_storage_backend(&config.storage).await?;
-    let export = if create_mode {
-        nbd_server::export::Export::create(config.clone(), remote).await?
-    } else {
-        nbd_server::export::Export::open(config.clone(), remote).await?
+    let export = match mode {
+        StartupMode::Create => nbd_server::export::Export::create(config.clone(), remote).await?,
+        StartupMode::Open => nbd_server::export::Export::open(config.clone(), remote).await?,
+        StartupMode::Clone => {
+            nbd_server::export::Export::clone_from_snapshot(config.clone(), remote).await?
+        }
     };
 
     let admin_socket = config.admin_sock.clone();
