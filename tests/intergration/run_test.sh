@@ -167,6 +167,8 @@ run_fio_job() {
 }
 
 modprobe nbd max_part=16
+# cleanup any leftover state from previous runs to ensure a clean slate for the integration test
+cleanup
 start_server
 
 echo "Creating ${NBD_SERVER_VM01}"

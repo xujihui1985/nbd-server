@@ -1774,6 +1774,7 @@ mod tests {
             .await
             .unwrap();
         export.write(0, b"abcd", false).await.unwrap();
+        export.flush().await.unwrap();
 
         let journal_path = dir.path().join("cache").join("snapshot.journal.json");
         let staging_path = dir.path().join("cache").join("pending.delta");
