@@ -182,7 +182,7 @@ impl LocalCache {
     pub fn mark_resident(&self, index: usize) -> Result<()> {
         let mut meta = self.meta.lock().unwrap();
         meta.resident.set(index, true);
-        meta.persist(&self.meta_path, false)
+        Ok(())
     }
 
     pub fn mark_resident_many(&self, indices: &[usize]) -> Result<()> {
@@ -193,14 +193,14 @@ impl LocalCache {
         for index in indices {
             meta.resident.set(*index, true);
         }
-        meta.persist(&self.meta_path, false)
+        Ok(())
     }
 
     pub fn mark_dirty(&self, index: usize) -> Result<()> {
         let mut meta = self.meta.lock().unwrap();
         meta.resident.set(index, true);
         meta.dirty.set(index, true);
-        meta.persist(&self.meta_path, true)
+        Ok(())
     }
 
     pub fn clear_dirty_all(&self) -> Result<()> {
