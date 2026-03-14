@@ -16,6 +16,7 @@ pub struct Cli {
 pub enum Commands {
     Create(ServerConfigArgs),
     Open(ServerConfigArgs),
+    Clone(CloneConfigArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -48,6 +49,34 @@ pub struct ServerConfigArgs {
     pub size: Option<u64>,
 }
 
+#[derive(Debug, Clone, Parser)]
+pub struct CloneConfigArgs {
+    #[arg(long)]
+    pub export_id: String,
+    #[arg(long)]
+    pub cache_dir: PathBuf,
+    #[arg(long)]
+    pub bucket: String,
+    #[arg(long)]
+    pub prefix: String,
+    #[arg(long)]
+    pub source_prefix: String,
+    #[arg(long)]
+    pub source_snapshot_id: Option<u64>,
+    #[arg(long)]
+    pub listen: SocketAddr,
+    #[arg(long)]
+    pub admin_sock: PathBuf,
+    #[arg(long, value_enum, default_value_t = StorageBackendKind::S3)]
+    pub storage_backend: StorageBackendKind,
+    #[arg(long, default_value = "us-east-1")]
+    pub region: String,
+    #[arg(long)]
+    pub endpoint_url: Option<String>,
+    #[arg(long)]
+    pub r2_account_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StorageBackendKind {
     S3,
@@ -65,6 +94,12 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct CloneSourceConfig {
+    pub prefix: String,
+    pub snapshot_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub export_id: String,
     pub cache_dir: PathBuf,
@@ -74,6 +109,7 @@ pub struct ServerConfig {
     pub chunk_size: u64,
     pub snapshot_id: Option<u64>,
     pub image_size: Option<u64>,
+    pub clone_source: Option<CloneSourceConfig>,
 }
 
 impl From<ServerConfigArgs> for ServerConfig {
@@ -94,6 +130,33 @@ impl From<ServerConfigArgs> for ServerConfig {
             chunk_size: value.chunk_size,
             snapshot_id: value.snapshot_id,
             image_size: value.size,
+            clone_source: None,
+        }
+    }
+}
+
+impl From<CloneConfigArgs> for ServerConfig {
+    fn from(value: CloneConfigArgs) -> Self {
+        Self {
+            export_id: value.export_id,
+            cache_dir: value.cache_dir,
+            storage: StorageConfig {
+                backend: value.storage_backend,
+                bucket: value.bucket,
+                prefix: value.prefix.trim_end_matches('/').to_string(),
+                region: value.region,
+                endpoint_url: value.endpoint_url,
+                r2_account_id: value.r2_account_id,
+            },
+            listen: value.listen,
+            admin_sock: value.admin_sock,
+            chunk_size: CHUNK_SIZE,
+            snapshot_id: None,
+            image_size: None,
+            clone_source: Some(CloneSourceConfig {
+                prefix: value.source_prefix.trim_end_matches('/').to_string(),
+                snapshot_id: value.source_snapshot_id,
+            }),
         }
     }
 }

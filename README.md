@@ -96,6 +96,24 @@ For R2, add:
   --r2-account-id <account-id>
 ```
 
+## Clone From Snapshot
+
+Create a new export lineage from a published remote snapshot. Before the first snapshot, reads are seeded from the source snapshot lazily. The first snapshot of the cloned export uploads a full base blob for the target export and becomes generation `1`.
+
+```bash
+cargo run -- clone \
+  --export-id vm02 \
+  --cache-dir /var/lib/nbd-server/vm02 \
+  --bucket my-bucket \
+  --prefix exports/vm02 \
+  --source-prefix exports/vm01 \
+  --source-snapshot-id 2 \
+  --listen 127.0.0.1:10810 \
+  --admin-sock /tmp/nbd-server-vm02.sock
+```
+
+Clone always resolves against a published remote snapshot. If a running `vm01` process has local dirty writes, those writes are ignored by clone.
+
 ## Attach With `nbd-client`
 
 The server speaks fixed-newstyle NBD and supports `OPT_GO` for a single export named exactly like `--export-id`.
