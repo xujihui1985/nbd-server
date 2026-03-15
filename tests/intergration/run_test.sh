@@ -154,7 +154,7 @@ wait_for_admin() {
 
 start_server() {
   local cmd=(
-    cargo run -- serve
+    "${REPO_ROOT}"/target/debug/nbd-server serve
     --cache-root "${NBD_SERVER_CACHE_ROOT}"
     --export-root "${NBD_SERVER_EXPORT_ROOT}"
     --bucket "${NBD_SERVER_BUCKET}"
