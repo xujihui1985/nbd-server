@@ -136,17 +136,11 @@ The storage backend remains process-global and is configured at startup just lik
 
 On startup, the server scans the global export root and loads all discovered `volume.json` objects into the registry.
 
-### Backward compatibility
+### CLI surface
 
-For the first implementation, keep the existing direct modes:
+The runtime CLI should expose only `serve`.
 
-- `create`
-- `open`
-- `clone`
-
-Those modes remain useful for tests and simple one-export workflows.
-
-`serve` is the new multi-export path.
+Per-volume lifecycle operations such as create, open, clone, snapshot, compact, and cache reset are handled through the admin API rather than through separate process modes.
 
 ## Remote Volume Metadata
 
