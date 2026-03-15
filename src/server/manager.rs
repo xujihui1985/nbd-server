@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
@@ -9,10 +8,11 @@ use crate::app::config::ServeConfig;
 use crate::core::engine::export::{
     CompactResponse, Export, ResetCacheResponse, SnapshotResponse, Status,
 };
-use crate::core::engine::spec::{CloneSource, ExportSpec, StorageNamespace};
+use crate::core::engine::spec::{CloneSource, ExportSpec};
 use crate::core::error::{Error, Result};
-use crate::core::model::volume::{VolumeMetadata, export_prefix, volume_key};
+use crate::core::model::volume::VolumeMetadata;
 use crate::core::storage::object_store::ObjectStore;
+use crate::core::storage::volume_repository::VolumeRepository;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateExportRequest {
@@ -46,14 +46,20 @@ struct ManagedExport {
 pub struct ExportManager {
     serve: ServeConfig,
     storage: Arc<dyn ObjectStore>,
+    repository: Arc<dyn VolumeRepository>,
     exports: RwLock<BTreeMap<String, Arc<ManagedExport>>>,
 }
 
 impl ExportManager {
-    pub async fn new(serve: ServeConfig, storage: Arc<dyn ObjectStore>) -> Result<Arc<Self>> {
+    pub async fn new(
+        serve: ServeConfig,
+        storage: Arc<dyn ObjectStore>,
+        repository: Arc<dyn VolumeRepository>,
+    ) -> Result<Arc<Self>> {
         let manager = Arc::new(Self {
             serve,
             storage,
+            repository,
             exports: RwLock::new(BTreeMap::new()),
         });
         manager.discover().await?;
@@ -73,19 +79,19 @@ impl ExportManager {
     pub async fn create_export(&self, request: CreateExportRequest) -> Result<ExportSummary> {
         self.ensure_not_loaded(&request.export_id).await?;
         let config = self.export_spec_for(&request.export_id, Some(request.size));
-        let export = Export::create(config, self.storage.clone()).await?;
+        let export = Export::create(config, self.storage.clone(), self.repository.clone()).await?;
         let volume = VolumeMetadata::new_empty(
             request.export_id.clone(),
             request.size,
             self.serve.chunk_size,
         );
-        let etag = self.create_remote_volume(&volume).await?;
+        let created = self.repository.create_volume(&volume).await?;
         self.exports.write().await.insert(
             request.export_id.clone(),
             Arc::new(ManagedExport {
                 export,
                 volume: Mutex::new(volume),
-                volume_etag: Mutex::new(Some(etag)),
+                volume_etag: Mutex::new(created.etag),
             }),
         );
         Ok(ExportSummary {
@@ -95,14 +101,15 @@ impl ExportManager {
 
     pub async fn open_export(&self, request: OpenExportRequest) -> Result<ExportSummary> {
         self.ensure_not_loaded(&request.export_id).await?;
-        let (volume, etag) = self.load_volume_with_etag(&request.export_id).await?;
+        let loaded = self.repository.load_volume(&request.export_id).await?;
+        let volume = loaded.metadata;
         let export = self.instantiate_from_volume(&volume).await?;
         self.exports.write().await.insert(
             request.export_id.clone(),
             Arc::new(ManagedExport {
                 export,
                 volume: Mutex::new(volume),
-                volume_etag: Mutex::new(etag),
+                volume_etag: Mutex::new(loaded.etag),
             }),
         );
         Ok(ExportSummary {
@@ -112,33 +119,36 @@ impl ExportManager {
 
     pub async fn clone_export(&self, request: CloneExportRequest) -> Result<ExportSummary> {
         self.ensure_not_loaded(&request.export_id).await?;
-        let (source_volume, _) = self
-            .load_volume_with_etag(&request.source_export_id)
+        let source_volume = self
+            .repository
+            .load_volume(&request.source_export_id)
             .await?;
         let source_snapshot_id = request
             .source_snapshot_id
             .clone()
-            .or_else(|| source_volume.current_snapshot_id.clone());
+            .or_else(|| source_volume.metadata.current_snapshot_id.clone());
         let volume = VolumeMetadata::new_clone(
             request.export_id.clone(),
-            source_volume.image_size,
-            source_volume.chunk_size,
+            source_volume.metadata.image_size,
+            source_volume.metadata.chunk_size,
             request.source_export_id.clone(),
             source_snapshot_id.clone(),
         );
         let mut config = self.export_spec_for(&request.export_id, None);
         config.clone_source = Some(CloneSource {
-            prefix: export_prefix(&self.serve.export_root, &request.source_export_id),
+            export_id: request.source_export_id.clone(),
             snapshot_id: source_snapshot_id.clone(),
         });
-        let export = Export::clone_from_snapshot(config, self.storage.clone()).await?;
-        let etag = self.create_remote_volume(&volume).await?;
+        let export =
+            Export::clone_from_snapshot(config, self.storage.clone(), self.repository.clone())
+                .await?;
+        let created = self.repository.create_volume(&volume).await?;
         self.exports.write().await.insert(
             request.export_id.clone(),
             Arc::new(ManagedExport {
                 export,
                 volume: Mutex::new(volume),
-                volume_etag: Mutex::new(Some(etag)),
+                volume_etag: Mutex::new(created.etag),
             }),
         );
         Ok(ExportSummary {
@@ -174,9 +184,9 @@ impl ExportManager {
         let managed = self.get_managed(export_id).await?;
         let response = managed.export.snapshot().await?;
         if response.snapshot_created {
-            let (volume, etag) = self.load_volume_with_etag(export_id).await?;
-            *managed.volume.lock().await = volume;
-            *managed.volume_etag.lock().await = etag;
+            let loaded = self.repository.load_volume(export_id).await?;
+            *managed.volume.lock().await = loaded.metadata;
+            *managed.volume_etag.lock().await = loaded.etag;
         }
         Ok(response)
     }
@@ -184,9 +194,9 @@ impl ExportManager {
     pub async fn compact(&self, export_id: &str) -> Result<CompactResponse> {
         let managed = self.get_managed(export_id).await?;
         let response = managed.export.compact().await?;
-        let (volume, etag) = self.load_volume_with_etag(export_id).await?;
-        *managed.volume.lock().await = volume;
-        *managed.volume_etag.lock().await = etag;
+        let loaded = self.repository.load_volume(export_id).await?;
+        *managed.volume.lock().await = loaded.metadata;
+        *managed.volume_etag.lock().await = loaded.etag;
         Ok(response)
     }
 
@@ -209,22 +219,15 @@ impl ExportManager {
     }
 
     async fn discover(&self) -> Result<()> {
-        let prefix = format!("{}/", self.serve.export_root.trim_end_matches('/'));
-        let keys = self.storage.list_prefix(&prefix).await?;
-        for key in keys {
-            if !key.ends_with("/volume.json") {
-                continue;
-            }
-            let stored = self.storage.get_object_with_etag(&key).await?;
-            let volume: VolumeMetadata = serde_json::from_slice(&stored.body)?;
-            volume.validate()?;
+        for loaded in self.repository.list_volumes().await? {
+            let volume = loaded.metadata;
             let export = self.instantiate_from_volume(&volume).await?;
             self.exports.write().await.insert(
                 volume.export_id.clone(),
                 Arc::new(ManagedExport {
                     export,
                     volume: Mutex::new(volume),
-                    volume_etag: Mutex::new(stored.etag),
+                    volume_etag: Mutex::new(loaded.etag),
                 }),
             );
         }
@@ -249,57 +252,31 @@ impl ExportManager {
         Ok(())
     }
 
-    async fn load_volume_with_etag(
-        &self,
-        export_id: &str,
-    ) -> Result<(VolumeMetadata, Option<String>)> {
-        let key = volume_key(&self.serve.export_root, export_id);
-        let stored = self.storage.get_object_with_etag(&key).await?;
-        let volume: VolumeMetadata = serde_json::from_slice(&stored.body)?;
-        volume.validate()?;
-        Ok((volume, stored.etag))
-    }
-
-    async fn create_remote_volume(&self, volume: &VolumeMetadata) -> Result<String> {
-        let key = volume_key(&self.serve.export_root, &volume.export_id);
-        let created = self
-            .storage
-            .put_bytes_if_absent(&key, Bytes::from(serde_json::to_vec_pretty(volume)?))
-            .await?;
-        if !created {
-            return Err(Error::Conflict(format!(
-                "export {} already exists remotely",
-                volume.export_id
-            )));
-        }
-        let (_, etag) = self.load_volume_with_etag(&volume.export_id).await?;
-        etag.ok_or_else(|| {
-            Error::InvalidRequest(format!(
-                "volume {} was created without an etag",
-                volume.export_id
-            ))
-        })
-    }
-
     async fn instantiate_from_volume(&self, volume: &VolumeMetadata) -> Result<Arc<Export>> {
         if let Some(snapshot_id) = &volume.current_snapshot_id {
             let mut config = self.export_spec_for(&volume.export_id, None);
             config.snapshot_id = Some(snapshot_id.clone());
-            return Export::open(config, self.storage.clone()).await;
+            return Export::open(config, self.storage.clone(), self.repository.clone()).await;
         }
 
         if let Some(seed) = &volume.clone_seed {
             let mut config = self.export_spec_for(&volume.export_id, None);
             config.clone_source = Some(CloneSource {
-                prefix: export_prefix(&self.serve.export_root, &seed.source_export_id),
+                export_id: seed.source_export_id.clone(),
                 snapshot_id: seed.source_snapshot_id.clone(),
             });
-            return Export::clone_from_snapshot(config, self.storage.clone()).await;
+            return Export::clone_from_snapshot(
+                config,
+                self.storage.clone(),
+                self.repository.clone(),
+            )
+            .await;
         }
 
         Export::create(
             self.export_spec_for(&volume.export_id, Some(volume.image_size)),
             self.storage.clone(),
+            self.repository.clone(),
         )
         .await
     }
@@ -312,10 +289,6 @@ impl ExportManager {
             snapshot_id: None,
             image_size,
             clone_source: None,
-            storage: StorageNamespace {
-                prefix: export_prefix(&self.serve.export_root, export_id),
-                volume_key: Some(volume_key(&self.serve.export_root, export_id)),
-            },
         }
     }
 }
@@ -333,6 +306,7 @@ mod tests {
     use crate::app::config::{ServeConfig, StorageBackendKind, StorageConfig};
     use crate::core::model::volume::{VolumeMetadata, volume_key};
     use crate::core::storage::object_store::{ObjectStore, StoredObject};
+    use crate::storage::build_volume_repository;
 
     use super::{CreateExportRequest, ExportManager};
 
@@ -479,7 +453,8 @@ mod tests {
     async fn create_export_persists_volume_metadata() {
         let dir = tempdir().unwrap();
         let remote = Arc::new(MemoryRemote::default());
-        let manager = ExportManager::new(serve_config(dir.path()), remote.clone())
+        let repository = build_volume_repository("exports".to_string(), remote.clone());
+        let manager = ExportManager::new(serve_config(dir.path()), remote.clone(), repository)
             .await
             .unwrap();
 
@@ -522,7 +497,8 @@ mod tests {
             .await
             .unwrap();
 
-        let manager = ExportManager::new(serve_config(dir.path()), remote)
+        let repository = build_volume_repository("exports".to_string(), remote.clone());
+        let manager = ExportManager::new(serve_config(dir.path()), remote, repository)
             .await
             .unwrap();
 

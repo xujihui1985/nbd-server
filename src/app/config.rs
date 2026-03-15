@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::core::engine::spec::{CloneSource, ExportSpec, StorageNamespace};
+use crate::core::engine::spec::{CloneSource, ExportSpec};
 
 pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
@@ -61,7 +61,7 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone)]
 pub struct CloneSourceConfig {
-    pub prefix: String,
+    pub export_id: String,
     pub snapshot_id: Option<String>,
 }
 
@@ -112,7 +112,7 @@ impl From<ServeConfigArgs> for ServeConfig {
 impl From<CloneSourceConfig> for CloneSource {
     fn from(value: CloneSourceConfig) -> Self {
         Self {
-            prefix: value.prefix,
+            export_id: value.export_id,
             snapshot_id: value.snapshot_id,
         }
     }
@@ -127,10 +127,6 @@ impl From<ServerConfig> for ExportSpec {
             snapshot_id: value.snapshot_id,
             image_size: value.image_size,
             clone_source: value.clone_source.map(Into::into),
-            storage: StorageNamespace {
-                prefix: value.storage.prefix,
-                volume_key: value.volume_key,
-            },
         }
     }
 }
