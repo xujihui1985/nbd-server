@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::core::engine::spec::{CloneSource, ExportSpec, StorageNamespace};
 
@@ -10,8 +10,13 @@ pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about)]
 pub struct Cli {
-    #[command(flatten)]
-    pub serve: ServeConfigArgs,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    Serve(ServeConfigArgs),
 }
 
 #[derive(Debug, Clone, Parser)]
