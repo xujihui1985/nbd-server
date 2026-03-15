@@ -1,6 +1,6 @@
 use clap::Parser;
 use nbd_server::Cli;
-use nbd_server::app::config::ServeConfig;
+use nbd_server::app::config::{Command, ServeConfig};
 use nbd_server::server::admin::serve_manager_admin;
 use nbd_server::server::manager::ExportManager;
 use nbd_server::storage::build_object_store;
@@ -14,7 +14,9 @@ async fn main() -> nbd_server::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let serve = ServeConfig::from(cli.serve);
+    let serve = match cli.command {
+        Command::Serve(args) => ServeConfig::from(args),
+    };
     let remote = build_object_store(&serve.storage).await?;
     let manager = ExportManager::new(serve.clone(), remote).await?;
     let admin_socket = serve.admin_sock.clone();
