@@ -5,11 +5,14 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{CloneSourceConfig, ServeConfig, ServerConfig};
-use crate::error::{Error, Result};
-use crate::export::{CompactResponse, Export, ResetCacheResponse, SnapshotResponse, Status};
-use crate::remote::StorageBackend;
-use crate::volume::{VolumeMetadata, export_prefix, volume_key};
+use crate::app::config::ServeConfig;
+use crate::core::engine::export::{
+    CompactResponse, Export, ResetCacheResponse, SnapshotResponse, Status,
+};
+use crate::core::engine::spec::{CloneSource, ExportSpec, StorageNamespace};
+use crate::core::error::{Error, Result};
+use crate::core::model::volume::{VolumeMetadata, export_prefix, volume_key};
+use crate::core::storage::object_store::ObjectStore;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateExportRequest {
@@ -42,12 +45,12 @@ struct ManagedExport {
 
 pub struct ExportManager {
     serve: ServeConfig,
-    storage: Arc<dyn StorageBackend>,
+    storage: Arc<dyn ObjectStore>,
     exports: RwLock<BTreeMap<String, Arc<ManagedExport>>>,
 }
 
 impl ExportManager {
-    pub async fn new(serve: ServeConfig, storage: Arc<dyn StorageBackend>) -> Result<Arc<Self>> {
+    pub async fn new(serve: ServeConfig, storage: Arc<dyn ObjectStore>) -> Result<Arc<Self>> {
         let manager = Arc::new(Self {
             serve,
             storage,
@@ -69,7 +72,7 @@ impl ExportManager {
 
     pub async fn create_export(&self, request: CreateExportRequest) -> Result<ExportSummary> {
         self.ensure_not_loaded(&request.export_id).await?;
-        let config = self.server_config_for(&request.export_id, Some(request.size));
+        let config = self.export_spec_for(&request.export_id, Some(request.size));
         let export = Export::create(config, self.storage.clone()).await?;
         let volume = VolumeMetadata::new_empty(
             request.export_id.clone(),
@@ -123,8 +126,8 @@ impl ExportManager {
             request.source_export_id.clone(),
             source_snapshot_id.clone(),
         );
-        let mut config = self.server_config_for(&request.export_id, None);
-        config.clone_source = Some(CloneSourceConfig {
+        let mut config = self.export_spec_for(&request.export_id, None);
+        config.clone_source = Some(CloneSource {
             prefix: export_prefix(&self.serve.export_root, &request.source_export_id),
             snapshot_id: source_snapshot_id.clone(),
         });
@@ -229,8 +232,7 @@ impl ExportManager {
     }
 
     async fn get_managed(&self, export_id: &str) -> Result<Arc<ManagedExport>> {
-        self
-            .exports
+        self.exports
             .read()
             .await
             .get(export_id)
@@ -281,14 +283,14 @@ impl ExportManager {
 
     async fn instantiate_from_volume(&self, volume: &VolumeMetadata) -> Result<Arc<Export>> {
         if let Some(snapshot_id) = &volume.current_snapshot_id {
-            let mut config = self.server_config_for(&volume.export_id, None);
+            let mut config = self.export_spec_for(&volume.export_id, None);
             config.snapshot_id = Some(snapshot_id.clone());
             return Export::open(config, self.storage.clone()).await;
         }
 
         if let Some(seed) = &volume.clone_seed {
-            let mut config = self.server_config_for(&volume.export_id, None);
-            config.clone_source = Some(CloneSourceConfig {
+            let mut config = self.export_spec_for(&volume.export_id, None);
+            config.clone_source = Some(CloneSource {
                 prefix: export_prefix(&self.serve.export_root, &seed.source_export_id),
                 snapshot_id: seed.source_snapshot_id.clone(),
             });
@@ -296,26 +298,24 @@ impl ExportManager {
         }
 
         Export::create(
-            self.server_config_for(&volume.export_id, Some(volume.image_size)),
+            self.export_spec_for(&volume.export_id, Some(volume.image_size)),
             self.storage.clone(),
         )
         .await
     }
 
-    fn server_config_for(&self, export_id: &str, image_size: Option<u64>) -> ServerConfig {
-        let mut storage = self.serve.storage.clone();
-        storage.prefix = export_prefix(&self.serve.export_root, export_id);
-        ServerConfig {
+    fn export_spec_for(&self, export_id: &str, image_size: Option<u64>) -> ExportSpec {
+        ExportSpec {
             export_id: export_id.to_string(),
             cache_dir: self.serve.cache_root.join(export_id),
-            storage,
-            listen: self.serve.listen,
-            admin_sock: self.serve.admin_sock.clone(),
             chunk_size: self.serve.chunk_size,
             snapshot_id: None,
             image_size,
             clone_source: None,
-            volume_key: Some(volume_key(&self.serve.export_root, export_id)),
+            storage: StorageNamespace {
+                prefix: export_prefix(&self.serve.export_root, export_id),
+                volume_key: Some(volume_key(&self.serve.export_root, export_id)),
+            },
         }
     }
 }
@@ -330,9 +330,9 @@ mod tests {
     use bytes::Bytes;
     use tempfile::tempdir;
 
-    use crate::config::{ServeConfig, StorageBackendKind, StorageConfig};
-    use crate::remote::{StorageBackend, StoredObject};
-    use crate::volume::{VolumeMetadata, volume_key};
+    use crate::app::config::{ServeConfig, StorageBackendKind, StorageConfig};
+    use crate::core::model::volume::{VolumeMetadata, volume_key};
+    use crate::core::storage::object_store::{ObjectStore, StoredObject};
 
     use super::{CreateExportRequest, ExportManager};
 
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl StorageBackend for MemoryRemote {
+    impl ObjectStore for MemoryRemote {
         async fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::Result<Bytes> {
             let objects = self.objects.lock().unwrap();
             let bytes = &objects.get(key).unwrap().body;

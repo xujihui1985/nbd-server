@@ -2,8 +2,8 @@ use std::fs::{File, create_dir_all, rename};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::bitmap::Bitmap;
-use crate::error::{Error, Result};
+use crate::core::cache::bitmap::Bitmap;
+use crate::core::error::{Error, Result};
 
 const META_MAGIC: &[u8; 8] = b"LZYNBDM1";
 

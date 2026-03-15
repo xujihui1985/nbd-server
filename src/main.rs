@@ -1,9 +1,9 @@
 use clap::Parser;
 use nbd_server::Cli;
-use nbd_server::admin::serve_manager_admin;
-use nbd_server::config::ServeConfig;
-use nbd_server::manager::ExportManager;
-use nbd_server::remote::build_storage_backend;
+use nbd_server::app::config::ServeConfig;
+use nbd_server::server::admin::serve_manager_admin;
+use nbd_server::server::manager::ExportManager;
+use nbd_server::storage::build_object_store;
 
 #[tokio::main]
 async fn main() -> nbd_server::Result<()> {
@@ -15,7 +15,7 @@ async fn main() -> nbd_server::Result<()> {
 
     let cli = Cli::parse();
     let serve = ServeConfig::from(cli.serve);
-    let remote = build_storage_backend(&serve.storage).await?;
+    let remote = build_object_store(&serve.storage).await?;
     let manager = ExportManager::new(serve.clone(), remote).await?;
     let admin_socket = serve.admin_sock.clone();
     let nbd_addr = serve.listen;
@@ -25,10 +25,9 @@ async fn main() -> nbd_server::Result<()> {
 
     let admin_task =
         tokio::spawn(async move { serve_manager_admin(&admin_socket, admin_manager).await });
-    let nbd_task =
-        tokio::spawn(
-            async move { nbd_server::nbd::serve_nbd_manager(nbd_addr, nbd_manager).await },
-        );
+    let nbd_task = tokio::spawn(async move {
+        nbd_server::server::nbd::serve_nbd_manager(nbd_addr, nbd_manager).await
+    });
 
     tokio::select! {
         result = admin_task => {

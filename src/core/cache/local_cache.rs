@@ -3,10 +3,10 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::bitmap::Bitmap;
-use crate::error::{Error, Result};
-use crate::manifest::chunk_count;
-use crate::meta::CacheMeta;
+use crate::core::cache::bitmap::Bitmap;
+use crate::core::error::{Error, Result};
+use crate::core::model::cache_meta::CacheMeta;
+use crate::core::model::manifest::chunk_count;
 
 #[derive(Debug)]
 pub struct LocalCache {

@@ -10,8 +10,10 @@ use axum::{
 use serde::Serialize;
 use tokio::net::UnixListener;
 
-use crate::error::Error;
-use crate::manager::{CloneExportRequest, CreateExportRequest, ExportManager, OpenExportRequest};
+use crate::core::error::Error;
+use crate::server::manager::{
+    CloneExportRequest, CreateExportRequest, ExportManager, OpenExportRequest,
+};
 
 #[derive(Clone)]
 struct ManagerAdminState {
@@ -55,14 +57,15 @@ pub async fn serve_manager_admin(
 
 async fn get_exports(
     State(state): State<ManagerAdminState>,
-) -> Json<Vec<crate::manager::ExportSummary>> {
+) -> Json<Vec<crate::server::manager::ExportSummary>> {
     Json(state.manager.list().await)
 }
 
 async fn post_create_export(
     State(state): State<ManagerAdminState>,
     Json(request): Json<CreateExportRequest>,
-) -> std::result::Result<Json<crate::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<Json<crate::server::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)>
+{
     state
         .manager
         .create_export(request)
@@ -74,7 +77,8 @@ async fn post_create_export(
 async fn post_open_export(
     State(state): State<ManagerAdminState>,
     Json(request): Json<OpenExportRequest>,
-) -> std::result::Result<Json<crate::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<Json<crate::server::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)>
+{
     state
         .manager
         .open_export(request)
@@ -86,7 +90,8 @@ async fn post_open_export(
 async fn post_clone_export(
     State(state): State<ManagerAdminState>,
     Json(request): Json<CloneExportRequest>,
-) -> std::result::Result<Json<crate::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<Json<crate::server::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)>
+{
     state
         .manager
         .clone_export(request)
@@ -110,7 +115,7 @@ async fn delete_export(
 async fn get_export_status(
     AxumPath(export_id): AxumPath<String>,
     State(state): State<ManagerAdminState>,
-) -> std::result::Result<Json<crate::export::Status>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<Json<crate::core::engine::export::Status>, (StatusCode, Json<ErrorBody>)> {
     state
         .manager
         .status(&export_id)
@@ -122,7 +127,10 @@ async fn get_export_status(
 async fn post_export_snapshot(
     AxumPath(export_id): AxumPath<String>,
     State(state): State<ManagerAdminState>,
-) -> std::result::Result<Json<crate::export::SnapshotResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<
+    Json<crate::core::engine::export::SnapshotResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
     state
         .manager
         .snapshot(&export_id)
@@ -134,7 +142,10 @@ async fn post_export_snapshot(
 async fn post_export_compact(
     AxumPath(export_id): AxumPath<String>,
     State(state): State<ManagerAdminState>,
-) -> std::result::Result<Json<crate::export::CompactResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<
+    Json<crate::core::engine::export::CompactResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
     state
         .manager
         .compact(&export_id)
@@ -146,7 +157,10 @@ async fn post_export_compact(
 async fn post_export_reset_cache(
     AxumPath(export_id): AxumPath<String>,
     State(state): State<ManagerAdminState>,
-) -> std::result::Result<Json<crate::export::ResetCacheResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> std::result::Result<
+    Json<crate::core::engine::export::ResetCacheResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
     state
         .manager
         .reset_cache(&export_id)

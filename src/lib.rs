@@ -1,16 +1,7 @@
-pub mod admin;
-pub mod bitmap;
-pub mod cache;
-pub mod config;
-pub mod error;
-pub mod export;
-pub mod journal;
-pub mod manager;
-pub mod manifest;
-pub mod meta;
-pub mod nbd;
-pub mod remote;
-pub mod volume;
+pub mod app;
+pub mod core;
+pub mod server;
+pub mod storage;
 
-pub use config::Cli;
-pub use error::{Error, Result};
+pub use app::config::Cli;
+pub use core::error::{Error, Result};
