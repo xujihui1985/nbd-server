@@ -17,6 +17,7 @@ required_tools=(
   curl
   jq
   fio
+  md5sum
   mkfs.ext4
   mount
   umount
@@ -46,18 +47,24 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 : "${NBD_SERVER_VM01_SIZE:=1073741824}"
 : "${NBD_SERVER_VM01:=vm01}"
 : "${NBD_SERVER_VM02:=vm02}"
+: "${NBD_SERVER_VM03:=vm03}"
 : "${NBD_SERVER_NBD0:=/dev/nbd0}"
 : "${NBD_SERVER_NBD1:=/dev/nbd1}"
+: "${NBD_SERVER_NBD2:=/dev/nbd2}"
 : "${NBD_SERVER_MOUNT_ROOT:=/var/tmp/nbd-server-it-mnt}"
 
 SERVER_LOG="${NBD_SERVER_MOUNT_ROOT}/server.log"
 VM01_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM01}"
 VM02_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM02}"
+VM03_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM03}"
 SERVER_PID=""
 VM01_SNAPSHOT_ID=""
+VM02_SNAPSHOT_ID=""
+VM02_FIXTURE_DIR="agent-fixture-tree"
+VM02_FIXTURE_MD5_MANIFEST="${NBD_SERVER_MOUNT_ROOT}/vm02-fixture.md5"
 
 mkdir -p "${NBD_SERVER_MOUNT_ROOT}"
-mkdir -p "${VM01_MOUNT}" "${VM02_MOUNT}"
+mkdir -p "${VM01_MOUNT}" "${VM02_MOUNT}" "${VM03_MOUNT}"
 mkdir -p "${NBD_SERVER_CACHE_ROOT}"
 
 cleanup() {
@@ -69,7 +76,11 @@ cleanup() {
   if mountpoint -q "${VM01_MOUNT}"; then
     umount "${VM01_MOUNT}"
   fi
+  if mountpoint -q "${VM03_MOUNT}"; then
+    umount "${VM03_MOUNT}"
+  fi
 
+  nbd-client -d "${NBD_SERVER_NBD2}" >/dev/null 2>&1 || true
   nbd-client -d "${NBD_SERVER_NBD1}" >/dev/null 2>&1 || true
   nbd-client -d "${NBD_SERVER_NBD0}" >/dev/null 2>&1 || true
 
@@ -166,6 +177,92 @@ run_fio_job() {
     --time_based=0
 }
 
+write_fixture_tree() {
+  local mount_dir="$1"
+  local root="${mount_dir}/${VM02_FIXTURE_DIR}"
+
+  rm -rf "${root}"
+  mkdir -p \
+    "${root}/alpha" \
+    "${root}/alpha/nested" \
+    "${root}/beta" \
+    "${root}/gamma/deep"
+
+  for index in $(seq 1 24); do
+    {
+      printf 'fixture export=%s clone=%s file=%02d\n' \
+        "${NBD_SERVER_VM02}" \
+        "${NBD_SERVER_VM03}" \
+        "${index}"
+      for line in $(seq 1 128); do
+        printf 'line=%03d value=%08d\n' "${line}" "$((index * 1000 + line))"
+      done
+    } >"${root}/alpha/file-${index}.txt"
+  done
+
+  for index in $(seq 1 12); do
+    {
+      printf 'nested export=%s index=%02d\n' "${NBD_SERVER_VM02}" "${index}"
+      for line in $(seq 1 96); do
+        printf 'payload=%02d-%03d-%s\n' "${index}" "${line}" "${NBD_SERVER_VM01}"
+      done
+    } >"${root}/alpha/nested/blob-${index}.log"
+  done
+
+  for index in $(seq 1 16); do
+    {
+      printf 'beta export=%s source=%s idx=%02d\n' \
+        "${NBD_SERVER_VM02}" \
+        "${NBD_SERVER_VM01}" \
+        "${index}"
+      for line in $(seq 1 80); do
+        printf 'record=%02d/%03d checksum-seed=%08d\n' "${index}" "${line}" "$((index * line))"
+      done
+    } >"${root}/beta/data-${index}.cfg"
+  done
+
+  for index in $(seq 1 8); do
+    {
+      printf 'gamma export=%s clone=%s idx=%02d\n' \
+        "${NBD_SERVER_VM02}" \
+        "${NBD_SERVER_VM03}" \
+        "${index}"
+      for line in $(seq 1 160); do
+        printf 'entry=%02d.%03d token=%08x\n' "${index}" "${line}" "$((index * 4096 + line))"
+      done
+    } >"${root}/gamma/deep/object-${index}.dat"
+  done
+
+  (
+    cd "${root}"
+    find . -type f -print0 \
+      | sort -z \
+      | xargs -0 md5sum
+  ) >"${VM02_FIXTURE_MD5_MANIFEST}"
+  sync
+}
+
+verify_fixture_tree() {
+  local mount_dir="$1"
+  local root="${mount_dir}/${VM02_FIXTURE_DIR}"
+  local actual_manifest="${NBD_SERVER_MOUNT_ROOT}/vm03-fixture.md5"
+
+  [[ -d "${root}" ]]
+  find "${root}" -type f -exec cat {} + >/dev/null
+
+  (
+    cd "${root}"
+    find . -type f -print0 \
+      | sort -z \
+      | xargs -0 md5sum
+  ) >"${actual_manifest}"
+
+  if ! diff -u "${VM02_FIXTURE_MD5_MANIFEST}" "${actual_manifest}"; then
+    echo "Fixture directory checksum manifest mismatch" >&2
+    return 1
+  fi
+}
+
 modprobe nbd max_part=16
 # cleanup any leftover state from previous runs to ensure a clean slate for the integration test
 cleanup
@@ -219,11 +316,33 @@ echo "Attaching ${NBD_SERVER_VM02} to ${NBD_SERVER_NBD1}"
 attach_export "${NBD_SERVER_VM02}" "${NBD_SERVER_NBD1}"
 mount "${NBD_SERVER_NBD1}" "${VM02_MOUNT}"
 run_fio_job "${VM02_MOUNT}" "${NBD_SERVER_VM02}-clone"
+write_fixture_tree "${VM02_MOUNT}"
 sync
 umount "${VM02_MOUNT}"
 nbd-client -d "${NBD_SERVER_NBD1}"
 
 echo "Snapshotting ${NBD_SERVER_VM02}"
-admin_curl POST "/v1/exports/${NBD_SERVER_VM02}/snapshot" | jq .
+VM02_SNAPSHOT_ID="$(
+  admin_curl POST "/v1/exports/${NBD_SERVER_VM02}/snapshot" \
+    | tee /dev/stderr \
+    | jq -r '.snapshot_id'
+)"
+if [[ -z "${VM02_SNAPSHOT_ID}" || "${VM02_SNAPSHOT_ID}" == "null" ]]; then
+  echo "Snapshot did not return a snapshot_id for ${NBD_SERVER_VM02}" >&2
+  exit 1
+fi
+
+echo "Cloning ${NBD_SERVER_VM03} from ${NBD_SERVER_VM02}@${VM02_SNAPSHOT_ID}"
+admin_curl POST /v1/exports/clone \
+  "{\"export_id\":\"${NBD_SERVER_VM03}\",\"source_export_id\":\"${NBD_SERVER_VM02}\",\"source_snapshot_id\":\"${VM02_SNAPSHOT_ID}\"}" \
+  | jq .
+
+echo "Attaching ${NBD_SERVER_VM03} to ${NBD_SERVER_NBD2}"
+attach_export "${NBD_SERVER_VM03}" "${NBD_SERVER_NBD2}"
+mount "${NBD_SERVER_NBD2}" "${VM03_MOUNT}"
+verify_fixture_tree "${VM03_MOUNT}"
+sync
+umount "${VM03_MOUNT}"
+nbd-client -d "${NBD_SERVER_NBD2}"
 
 echo "Integration flow completed successfully."
