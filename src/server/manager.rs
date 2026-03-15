@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::app::config::ServeConfig;
 use crate::core::engine::export::{
@@ -32,22 +32,15 @@ pub struct CloneExportRequest {
     pub source_snapshot_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ExportSummary {
-    pub export_id: String,
-}
-
-struct ManagedExport {
-    export: Arc<Export>,
-    volume: Mutex<VolumeMetadata>,
-    volume_etag: Mutex<Option<String>>,
-}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExportId(pub String);
 
 pub struct ExportManager {
     serve: ServeConfig,
     storage: Arc<dyn ObjectStore>,
     repository: Arc<dyn VolumeRepository>,
-    exports: RwLock<BTreeMap<String, Arc<ManagedExport>>>,
+    exports: RwLock<BTreeMap<String, Arc<Export>>>,
 }
 
 impl ExportManager {
@@ -66,17 +59,17 @@ impl ExportManager {
         Ok(manager)
     }
 
-    pub async fn list(&self) -> Vec<ExportSummary> {
+    pub async fn list(&self) -> Vec<ExportId> {
         self.exports
             .read()
             .await
             .keys()
             .cloned()
-            .map(|export_id| ExportSummary { export_id })
+            .map(ExportId)
             .collect()
     }
 
-    pub async fn create_export(&self, request: CreateExportRequest) -> Result<ExportSummary> {
+    pub async fn create_export(&self, request: CreateExportRequest) -> Result<ExportId> {
         self.ensure_not_loaded(&request.export_id).await?;
         let config = self.export_spec_for(&request.export_id, Some(request.size));
         let export = Export::create(config, self.storage.clone(), self.repository.clone()).await?;
@@ -85,39 +78,21 @@ impl ExportManager {
             request.size,
             self.serve.chunk_size,
         );
-        let created = self.repository.create_volume(&volume).await?;
-        self.exports.write().await.insert(
-            request.export_id.clone(),
-            Arc::new(ManagedExport {
-                export,
-                volume: Mutex::new(volume),
-                volume_etag: Mutex::new(created.etag),
-            }),
-        );
-        Ok(ExportSummary {
-            export_id: request.export_id,
-        })
+        self.repository.create_volume(&volume).await?;
+        self.exports.write().await.insert(request.export_id.clone(), export);
+        Ok(ExportId(request.export_id))
     }
 
-    pub async fn open_export(&self, request: OpenExportRequest) -> Result<ExportSummary> {
+    pub async fn open_export(&self, request: OpenExportRequest) -> Result<ExportId> {
         self.ensure_not_loaded(&request.export_id).await?;
         let loaded = self.repository.load_volume(&request.export_id).await?;
         let volume = loaded.metadata;
         let export = self.instantiate_from_volume(&volume).await?;
-        self.exports.write().await.insert(
-            request.export_id.clone(),
-            Arc::new(ManagedExport {
-                export,
-                volume: Mutex::new(volume),
-                volume_etag: Mutex::new(loaded.etag),
-            }),
-        );
-        Ok(ExportSummary {
-            export_id: request.export_id,
-        })
+        self.exports.write().await.insert(request.export_id.clone(), export);
+        Ok(ExportId(request.export_id))
     }
 
-    pub async fn clone_export(&self, request: CloneExportRequest) -> Result<ExportSummary> {
+    pub async fn clone_export(&self, request: CloneExportRequest) -> Result<ExportId> {
         self.ensure_not_loaded(&request.export_id).await?;
         let source_volume = self
             .repository
@@ -142,18 +117,9 @@ impl ExportManager {
         let export =
             Export::clone_from_snapshot(config, self.storage.clone(), self.repository.clone())
                 .await?;
-        let created = self.repository.create_volume(&volume).await?;
-        self.exports.write().await.insert(
-            request.export_id.clone(),
-            Arc::new(ManagedExport {
-                export,
-                volume: Mutex::new(volume),
-                volume_etag: Mutex::new(created.etag),
-            }),
-        );
-        Ok(ExportSummary {
-            export_id: request.export_id,
-        })
+        self.repository.create_volume(&volume).await?;
+        self.exports.write().await.insert(request.export_id.clone(), export);
+        Ok(ExportId(request.export_id))
     }
 
     pub async fn remove_export(&self, export_id: &str) -> Result<()> {
@@ -166,14 +132,12 @@ impl ExportManager {
     }
 
     pub async fn get_export(&self, export_id: &str) -> Result<Arc<Export>> {
-        Ok(self
-            .exports
+        self.exports
             .read()
             .await
             .get(export_id)
-            .ok_or_else(|| Error::InvalidRequest(format!("unknown export {export_id}")))?
-            .export
-            .clone())
+            .cloned()
+            .ok_or_else(|| Error::InvalidRequest(format!("unknown export {export_id}")))
     }
 
     pub async fn status(&self, export_id: &str) -> Result<Status> {
@@ -181,23 +145,11 @@ impl ExportManager {
     }
 
     pub async fn snapshot(&self, export_id: &str) -> Result<SnapshotResponse> {
-        let managed = self.get_managed(export_id).await?;
-        let response = managed.export.snapshot().await?;
-        if response.snapshot_created {
-            let loaded = self.repository.load_volume(export_id).await?;
-            *managed.volume.lock().await = loaded.metadata;
-            *managed.volume_etag.lock().await = loaded.etag;
-        }
-        Ok(response)
+        self.get_export(export_id).await?.snapshot().await
     }
 
     pub async fn compact(&self, export_id: &str) -> Result<CompactResponse> {
-        let managed = self.get_managed(export_id).await?;
-        let response = managed.export.compact().await?;
-        let loaded = self.repository.load_volume(export_id).await?;
-        *managed.volume.lock().await = loaded.metadata;
-        *managed.volume_etag.lock().await = loaded.etag;
-        Ok(response)
+        self.get_export(export_id).await?.compact().await
     }
 
     pub async fn reset_cache(&self, export_id: &str) -> Result<ResetCacheResponse> {
@@ -210,7 +162,7 @@ impl ExportManager {
             .read()
             .await
             .values()
-            .map(|managed| managed.export.clone())
+            .cloned()
             .collect();
         for export in exports {
             export.shutdown()?;
@@ -222,25 +174,9 @@ impl ExportManager {
         for loaded in self.repository.list_volumes().await? {
             let volume = loaded.metadata;
             let export = self.instantiate_from_volume(&volume).await?;
-            self.exports.write().await.insert(
-                volume.export_id.clone(),
-                Arc::new(ManagedExport {
-                    export,
-                    volume: Mutex::new(volume),
-                    volume_etag: Mutex::new(loaded.etag),
-                }),
-            );
+            self.exports.write().await.insert(volume.export_id.clone(), export);
         }
         Ok(())
-    }
-
-    async fn get_managed(&self, export_id: &str) -> Result<Arc<ManagedExport>> {
-        self.exports
-            .read()
-            .await
-            .get(export_id)
-            .cloned()
-            .ok_or_else(|| Error::InvalidRequest(format!("unknown export {export_id}")))
     }
 
     async fn ensure_not_loaded(&self, export_id: &str) -> Result<()> {
@@ -308,7 +244,7 @@ mod tests {
     use crate::core::storage::object_store::{ObjectStore, StoredObject};
     use crate::storage::build_volume_repository;
 
-    use super::{CreateExportRequest, ExportManager};
+    use super::{CreateExportRequest, ExportId, ExportManager};
 
     #[derive(Clone)]
     struct MemoryObject {
@@ -473,6 +409,7 @@ mod tests {
         let volume: VolumeMetadata = serde_json::from_slice(&volume).unwrap();
         assert_eq!(volume.export_id, "vm01");
         assert_eq!(manager.list().await.len(), 1);
+        assert_eq!(manager.list().await[0], ExportId("vm01".to_string()));
     }
 
     #[tokio::test]
@@ -504,6 +441,6 @@ mod tests {
 
         let exports = manager.list().await;
         assert_eq!(exports.len(), 1);
-        assert_eq!(exports[0].export_id, "vm01");
+        assert_eq!(exports[0], ExportId("vm01".to_string()));
     }
 }
