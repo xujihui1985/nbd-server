@@ -229,13 +229,13 @@ impl ExportManager {
     }
 
     async fn get_managed(&self, export_id: &str) -> Result<Arc<ManagedExport>> {
-        Ok(self
+        self
             .exports
             .read()
             .await
             .get(export_id)
             .cloned()
-            .ok_or_else(|| Error::InvalidRequest(format!("unknown export {export_id}")))?)
+            .ok_or_else(|| Error::InvalidRequest(format!("unknown export {export_id}")))
     }
 
     async fn ensure_not_loaded(&self, export_id: &str) -> Result<()> {

@@ -96,14 +96,13 @@ impl Manifest {
 
         let refs: BTreeMap<u32, &RefEntry> =
             self.refs.iter().map(|entry| (entry.id, entry)).collect();
-        if let Some(base_ref) = self.base_ref {
-            if !refs.contains_key(&base_ref) {
+        if let Some(base_ref) = self.base_ref
+            && !refs.contains_key(&base_ref) {
                 return Err(Error::InvalidManifest(format!(
                     "base_ref {} missing from refs",
                     base_ref
                 )));
             }
-        }
 
         let mut last_index = None;
         for entry in &self.entries {
@@ -113,14 +112,13 @@ impl Manifest {
                     entry.index, self.chunk_count
                 )));
             }
-            if let Some(previous) = last_index {
-                if entry.index <= previous {
+            if let Some(previous) = last_index
+                && entry.index <= previous {
                     return Err(Error::InvalidManifest(format!(
                         "entries not strictly ordered: {} after {}",
                         entry.index, previous
                     )));
                 }
-            }
             last_index = Some(entry.index);
 
             if !refs.contains_key(&entry.ref_id) {

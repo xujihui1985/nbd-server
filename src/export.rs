@@ -270,7 +270,7 @@ impl Export {
             )?;
             cache.set_clean_shutdown(false)?;
             let chunk_total = cache.chunk_count();
-            return Ok(Arc::new(Self {
+            Ok(Arc::new(Self {
                 journal_path: config.cache_dir.join("snapshot.journal.json"),
                 clone_seed_path,
                 config,
@@ -282,7 +282,7 @@ impl Export {
                 operation_running: AtomicBool::new(false),
                 operation_name: StdMutex::new(None),
                 chunk_locks: (0..chunk_total).map(|_| Mutex::new(())).collect(),
-            }));
+            }))
         } else {
             let resolved = resolve_manifest_for_clone(&*remote, &clone_source).await?;
             CloneSeedRecord {
@@ -300,7 +300,7 @@ impl Export {
             cache.set_clean_shutdown(false)?;
 
             let chunk_total = cache.chunk_count();
-            return Ok(Arc::new(Self {
+            Ok(Arc::new(Self {
                 journal_path: config.cache_dir.join("snapshot.journal.json"),
                 clone_seed_path,
                 config,
@@ -312,7 +312,7 @@ impl Export {
                 operation_running: AtomicBool::new(false),
                 operation_name: StdMutex::new(None),
                 chunk_locks: (0..chunk_total).map(|_| Mutex::new(())).collect(),
-            }));
+            }))
         }
     }
 
