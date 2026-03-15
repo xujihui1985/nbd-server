@@ -12,5 +12,5 @@ pub mod nbd;
 pub mod remote;
 pub mod volume;
 
-pub use config::{Cli, Commands};
+pub use config::Cli;
 pub use error::{Error, Result};

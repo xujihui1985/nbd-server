@@ -66,10 +66,7 @@ For R2, add `--storage-backend r2 --region auto --r2-account-id <account-id>` to
 
 ## Attach With `nbd-client`
 
-The server speaks fixed-newstyle NBD and supports `OPT_GO`.
-
-- in direct mode, there is one export named exactly like `--export-id`
-- in `serve` mode, the export name is the managed `export_id`
+The server speaks fixed-newstyle NBD and supports `OPT_GO`. The NBD export name is the managed `export_id`.
 
 ```bash
 sudo modprobe nbd max_part=8
@@ -202,9 +199,6 @@ curl -X POST --unix-socket /tmp/nbd-server.sock \
 `volume.json` stores the current published snapshot id for the export. The manifest path is inferred from that snapshot id.
 Older snapshot objects are not deleted automatically when a new snapshot or compaction is published.
 
-## Direct Single-Export Modes
-
-`create`, `open`, and `clone` still exist as compatibility commands for one-export workflows and tests. Those commands require explicit `--cache-dir`, `--prefix`, and storage flags because they bypass the multi-export manager entirely.
 
 ## Recovery
 

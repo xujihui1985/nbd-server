@@ -49,19 +49,6 @@ const PREFERRED_BLOCK_SIZE: u32 = 4096;
 const MAX_BLOCK_SIZE: u32 = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
 
-pub async fn serve_nbd(addr: std::net::SocketAddr, export: Arc<Export>) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let export = export.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, export).await {
-                tracing::warn!("nbd session ended with error: {error}");
-            }
-        });
-    }
-}
-
 pub async fn serve_nbd_manager(
     addr: std::net::SocketAddr,
     manager: Arc<ExportManager>,
@@ -76,14 +63,6 @@ pub async fn serve_nbd_manager(
             }
         });
     }
-}
-
-async fn handle_client(mut stream: TcpStream, export: Arc<Export>) -> Result<()> {
-    let client_flags = send_handshake(&mut stream).await?;
-    if !negotiate_options(&mut stream, export.clone(), client_flags).await? {
-        return Ok(());
-    }
-    transmission_phase(stream, export).await
 }
 
 async fn handle_client_manager(mut stream: TcpStream, manager: Arc<ExportManager>) -> Result<()> {
@@ -104,62 +83,6 @@ async fn send_handshake(stream: &mut TcpStream) -> Result<u32> {
     let mut client_flags = [0_u8; 4];
     stream.read_exact(&mut client_flags).await?;
     Ok(u32::from_be_bytes(client_flags))
-}
-
-async fn negotiate_options(
-    stream: &mut TcpStream,
-    export: Arc<Export>,
-    client_flags: u32,
-) -> Result<bool> {
-    loop {
-        let mut header = [0_u8; 16];
-        stream.read_exact(&mut header).await?;
-
-        let magic = u64::from_be_bytes(header[0..8].try_into().unwrap());
-        if magic != NBD_IHAVEOPT {
-            return Err(Error::InvalidRequest(format!(
-                "unexpected option magic {magic:#x}"
-            )));
-        }
-
-        let option = u32::from_be_bytes(header[8..12].try_into().unwrap());
-        let len = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
-        let mut payload = vec![0_u8; len];
-        stream.read_exact(&mut payload).await?;
-
-        match option {
-            NBD_OPT_EXPORT_NAME => {
-                validate_export_name(&payload, export.export_name())?;
-                send_export_legacy(stream, &export, client_flags).await?;
-                return Ok(true);
-            }
-            NBD_OPT_GO | NBD_OPT_INFO => {
-                let go = option == NBD_OPT_GO;
-                let request = parse_info_request(&payload)?;
-                if request.export_name != export.export_name() {
-                    send_option_reply(stream, option, NBD_REP_ERR_UNKNOWN, &[]).await?;
-                    continue;
-                }
-
-                let infos = requested_infos(&request);
-                for info in infos {
-                    let payload = encode_info_reply(info, &export)?;
-                    send_option_reply(stream, option, NBD_REP_INFO, &payload).await?;
-                }
-                send_option_reply(stream, option, NBD_REP_ACK, &[]).await?;
-                if go {
-                    return Ok(true);
-                }
-            }
-            NBD_OPT_ABORT => {
-                send_option_reply(stream, option, NBD_REP_ACK, &[]).await?;
-                return Ok(false);
-            }
-            other => {
-                send_option_reply(stream, other, NBD_REP_ERR_UNSUP, &[]).await?;
-            }
-        }
-    }
 }
 
 async fn negotiate_options_manager(
@@ -338,16 +261,6 @@ async fn transmission_phase(stream: TcpStream, export: Arc<Export>) -> Result<()
     writer_task
         .await
         .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))??;
-    Ok(())
-}
-
-fn validate_export_name(payload: &[u8], expected: &str) -> Result<()> {
-    let name = parse_export_name(payload)?;
-    if name != expected {
-        return Err(Error::InvalidRequest(format!(
-            "unknown export {name}, expected {expected}"
-        )));
-    }
     Ok(())
 }
 

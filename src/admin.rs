@@ -11,13 +11,7 @@ use serde::Serialize;
 use tokio::net::UnixListener;
 
 use crate::error::Error;
-use crate::export::Export;
 use crate::manager::{CloneExportRequest, CreateExportRequest, ExportManager, OpenExportRequest};
-
-#[derive(Clone)]
-struct AdminState {
-    export: Arc<Export>,
-}
 
 #[derive(Clone)]
 struct ManagerAdminState {
@@ -27,22 +21,6 @@ struct ManagerAdminState {
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
-}
-
-pub async fn serve_admin(socket_path: &Path, export: Arc<Export>) -> crate::Result<()> {
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-    let listener = UnixListener::bind(socket_path)?;
-    let router = Router::new()
-        .route("/v1/status", get(get_status))
-        .route("/v1/snapshot", post(post_snapshot))
-        .route("/v1/compact", post(post_compact))
-        .route("/v1/cache/reset", post(post_reset_cache))
-        .with_state(AdminState { export });
-    axum::serve(listener, router)
-        .await
-        .map_err(crate::Error::Io)
 }
 
 pub async fn serve_manager_admin(
@@ -73,21 +51,6 @@ pub async fn serve_manager_admin(
     axum::serve(listener, router)
         .await
         .map_err(crate::Error::Io)
-}
-
-async fn get_status(State(state): State<AdminState>) -> Json<crate::export::Status> {
-    Json(state.export.status().await)
-}
-
-async fn post_snapshot(
-    State(state): State<AdminState>,
-) -> std::result::Result<Json<crate::export::SnapshotResponse>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .export
-        .snapshot()
-        .await
-        .map(Json)
-        .map_err(error_response)
 }
 
 async fn get_exports(
@@ -156,17 +119,6 @@ async fn get_export_status(
         .map_err(error_response)
 }
 
-async fn post_compact(
-    State(state): State<AdminState>,
-) -> std::result::Result<Json<crate::export::CompactResponse>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .export
-        .compact()
-        .await
-        .map(Json)
-        .map_err(error_response)
-}
-
 async fn post_export_snapshot(
     AxumPath(export_id): AxumPath<String>,
     State(state): State<ManagerAdminState>,
@@ -186,17 +138,6 @@ async fn post_export_compact(
     state
         .manager
         .compact(&export_id)
-        .await
-        .map(Json)
-        .map_err(error_response)
-}
-
-async fn post_reset_cache(
-    State(state): State<AdminState>,
-) -> std::result::Result<Json<crate::export::ResetCacheResponse>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .export
-        .reset_cache()
         .await
         .map(Json)
         .map_err(error_response)
