@@ -90,6 +90,11 @@ cleanup() {
   fi
 
   rm -f "${NBD_SERVER_ADMIN_SOCK}"
+  rm -f "${VM02_FIXTURE_MD5_MANIFEST}" "${NBD_SERVER_MOUNT_ROOT}/vm03-fixture.md5"
+  rm -rf \
+    "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM01}" \
+    "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM02}" \
+    "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM03}"
 }
 
 trap cleanup EXIT
@@ -282,6 +287,7 @@ verify_fixture_tree() {
     echo "Fixture directory checksum manifest mismatch" >&2
     return 1
   fi
+  echo "Directory checksum verification succeeded"
 }
 
 modprobe nbd max_part=16
