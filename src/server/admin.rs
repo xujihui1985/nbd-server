@@ -11,9 +11,7 @@ use serde::Serialize;
 use tokio::net::UnixListener;
 
 use crate::core::error::Error;
-use crate::server::manager::{
-    CloneExportRequest, CreateExportRequest, ExportManager, OpenExportRequest,
-};
+use crate::server::manager::{CloneExportRequest, CreateExportRequest, ExportId, ExportManager, OpenExportRequest};
 
 #[derive(Clone)]
 struct ManagerAdminState {
@@ -55,17 +53,14 @@ pub async fn serve_manager_admin(
         .map_err(crate::Error::Io)
 }
 
-async fn get_exports(
-    State(state): State<ManagerAdminState>,
-) -> Json<Vec<crate::server::manager::ExportSummary>> {
+async fn get_exports(State(state): State<ManagerAdminState>) -> Json<Vec<ExportId>> {
     Json(state.manager.list().await)
 }
 
 async fn post_create_export(
     State(state): State<ManagerAdminState>,
     Json(request): Json<CreateExportRequest>,
-) -> std::result::Result<Json<crate::server::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)>
-{
+) -> std::result::Result<Json<ExportId>, (StatusCode, Json<ErrorBody>)> {
     state
         .manager
         .create_export(request)
@@ -77,8 +72,7 @@ async fn post_create_export(
 async fn post_open_export(
     State(state): State<ManagerAdminState>,
     Json(request): Json<OpenExportRequest>,
-) -> std::result::Result<Json<crate::server::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)>
-{
+) -> std::result::Result<Json<ExportId>, (StatusCode, Json<ErrorBody>)> {
     state
         .manager
         .open_export(request)
@@ -90,8 +84,7 @@ async fn post_open_export(
 async fn post_clone_export(
     State(state): State<ManagerAdminState>,
     Json(request): Json<CloneExportRequest>,
-) -> std::result::Result<Json<crate::server::manager::ExportSummary>, (StatusCode, Json<ErrorBody>)>
-{
+) -> std::result::Result<Json<ExportId>, (StatusCode, Json<ErrorBody>)> {
     state
         .manager
         .clone_export(request)

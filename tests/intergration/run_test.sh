@@ -48,23 +48,30 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 : "${NBD_SERVER_VM01:=vm01}"
 : "${NBD_SERVER_VM02:=vm02}"
 : "${NBD_SERVER_VM03:=vm03}"
+: "${NBD_SERVER_VM04:=vm04}"
 : "${NBD_SERVER_NBD0:=/dev/nbd0}"
 : "${NBD_SERVER_NBD1:=/dev/nbd1}"
 : "${NBD_SERVER_NBD2:=/dev/nbd2}"
+: "${NBD_SERVER_NBD3:=/dev/nbd3}"
 : "${NBD_SERVER_MOUNT_ROOT:=/var/tmp/nbd-server-it-mnt}"
 
 SERVER_LOG="${NBD_SERVER_MOUNT_ROOT}/server.log"
 VM01_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM01}"
 VM02_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM02}"
 VM03_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM03}"
+VM04_MOUNT="${NBD_SERVER_MOUNT_ROOT}/${NBD_SERVER_VM04}"
 SERVER_PID=""
 VM01_SNAPSHOT_ID=""
 VM02_SNAPSHOT_ID=""
+VM03_SNAPSHOT_ID=""
 VM02_FIXTURE_DIR="agent-fixture-tree"
 VM02_FIXTURE_MD5_MANIFEST="${NBD_SERVER_MOUNT_ROOT}/vm02-fixture.md5"
+VM03_HISTORY_DIR="history-rounds"
+VM03_FULL_MD5_MANIFEST="${NBD_SERVER_MOUNT_ROOT}/vm03-full-tree.md5"
+VM04_FULL_MD5_MANIFEST="${NBD_SERVER_MOUNT_ROOT}/vm04-full-tree.md5"
 
 mkdir -p "${NBD_SERVER_MOUNT_ROOT}"
-mkdir -p "${VM01_MOUNT}" "${VM02_MOUNT}" "${VM03_MOUNT}"
+mkdir -p "${VM01_MOUNT}" "${VM02_MOUNT}" "${VM03_MOUNT}" "${VM04_MOUNT}"
 mkdir -p "${NBD_SERVER_CACHE_ROOT}"
 
 cleanup() {
@@ -79,7 +86,11 @@ cleanup() {
   if mountpoint -q "${VM03_MOUNT}"; then
     umount "${VM03_MOUNT}"
   fi
+  if mountpoint -q "${VM04_MOUNT}"; then
+    umount "${VM04_MOUNT}"
+  fi
 
+  nbd-client -d "${NBD_SERVER_NBD3}" >/dev/null 2>&1 || true
   nbd-client -d "${NBD_SERVER_NBD2}" >/dev/null 2>&1 || true
   nbd-client -d "${NBD_SERVER_NBD1}" >/dev/null 2>&1 || true
   nbd-client -d "${NBD_SERVER_NBD0}" >/dev/null 2>&1 || true
@@ -90,11 +101,16 @@ cleanup() {
   fi
 
   rm -f "${NBD_SERVER_ADMIN_SOCK}"
-  rm -f "${VM02_FIXTURE_MD5_MANIFEST}" "${NBD_SERVER_MOUNT_ROOT}/vm03-fixture.md5"
+  rm -f \
+    "${VM02_FIXTURE_MD5_MANIFEST}" \
+    "${NBD_SERVER_MOUNT_ROOT}/vm03-fixture.md5" \
+    "${VM03_FULL_MD5_MANIFEST}" \
+    "${VM04_FULL_MD5_MANIFEST}"
   rm -rf \
     "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM01}" \
     "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM02}" \
-    "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM03}"
+    "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM03}" \
+    "${NBD_SERVER_CACHE_ROOT}/${NBD_SERVER_VM04}"
 }
 
 trap cleanup EXIT
@@ -290,6 +306,61 @@ verify_fixture_tree() {
   echo "Directory checksum verification succeeded"
 }
 
+record_tree_manifest() {
+  local mount_dir="$1"
+  local output_path="$2"
+
+  (
+    cd "${mount_dir}"
+    find . -type f -print0 \
+      | sort -z \
+      | xargs -0 md5sum
+  ) >"${output_path}"
+}
+
+verify_tree_manifest() {
+  local mount_dir="$1"
+  local expected_manifest="$2"
+  local actual_manifest="$3"
+  local label="$4"
+
+  find "${mount_dir}" -type f -exec cat {} + >/dev/null
+  record_tree_manifest "${mount_dir}" "${actual_manifest}"
+
+  if ! diff -u "${expected_manifest}" "${actual_manifest}"; then
+    echo "${label} checksum manifest mismatch" >&2
+    return 1
+  fi
+
+  echo "${label} checksum verification succeeded"
+}
+
+write_vm03_round_files() {
+  local mount_dir="$1"
+  local round="$2"
+  local root="${mount_dir}/${VM03_HISTORY_DIR}/round-${round}"
+
+  mkdir -p "${root}/alpha" "${root}/beta"
+
+  for index in $(seq 1 6); do
+    {
+      printf 'vm=%s round=%s series=alpha file=%02d\n' "${NBD_SERVER_VM03}" "${round}" "${index}"
+      for line in $(seq 1 48); do
+        printf 'alpha.%s.%02d.%03d seed=%08d\n' "${round}" "${index}" "${line}" "$((round * index * 100 + line))"
+      done
+    } >"${root}/alpha/file-${index}.txt"
+  done
+
+  for index in $(seq 1 4); do
+    {
+      printf 'vm=%s round=%s series=beta file=%02d\n' "${NBD_SERVER_VM03}" "${round}" "${index}"
+      for line in $(seq 1 64); do
+        printf 'beta.%s.%02d.%03d token=%08x\n' "${round}" "${index}" "${line}" "$((round * 4096 + index * 256 + line))"
+      done
+    } >"${root}/beta/blob-${index}.log"
+  done
+}
+
 modprobe nbd max_part=16
 # cleanup any leftover state from previous runs to ensure a clean slate for the integration test
 cleanup
@@ -371,5 +442,47 @@ verify_fixture_tree "${VM03_MOUNT}"
 sync
 umount "${VM03_MOUNT}"
 nbd-client -d "${NBD_SERVER_NBD2}"
+
+for round in 1 2 3; do
+  echo "Attaching ${NBD_SERVER_VM03} for round ${round}"
+  attach_export "${NBD_SERVER_VM03}" "${NBD_SERVER_NBD2}"
+  mount "${NBD_SERVER_NBD2}" "${VM03_MOUNT}"
+  write_vm03_round_files "${VM03_MOUNT}" "${round}"
+  sync
+  umount "${VM03_MOUNT}"
+  nbd-client -d "${NBD_SERVER_NBD2}"
+
+  echo "Snapshotting ${NBD_SERVER_VM03} after round ${round}"
+  VM03_SNAPSHOT_ID="$(
+    admin_curl POST "/v1/exports/${NBD_SERVER_VM03}/snapshot" \
+      | tee /dev/stderr \
+      | jq -r '.snapshot_id'
+  )"
+  if [[ -z "${VM03_SNAPSHOT_ID}" || "${VM03_SNAPSHOT_ID}" == "null" ]]; then
+    echo "Snapshot did not return a snapshot_id for ${NBD_SERVER_VM03} round ${round}" >&2
+    exit 1
+  fi
+done
+
+echo "Recording full tree manifest for ${NBD_SERVER_VM03}"
+attach_export "${NBD_SERVER_VM03}" "${NBD_SERVER_NBD2}"
+mount "${NBD_SERVER_NBD2}" "${VM03_MOUNT}"
+record_tree_manifest "${VM03_MOUNT}" "${VM03_FULL_MD5_MANIFEST}"
+sync
+umount "${VM03_MOUNT}"
+nbd-client -d "${NBD_SERVER_NBD2}"
+
+echo "Cloning ${NBD_SERVER_VM04} from ${NBD_SERVER_VM03}@${VM03_SNAPSHOT_ID}"
+admin_curl POST /v1/exports/clone \
+  "{\"export_id\":\"${NBD_SERVER_VM04}\",\"source_export_id\":\"${NBD_SERVER_VM03}\",\"source_snapshot_id\":\"${VM03_SNAPSHOT_ID}\"}" \
+  | jq .
+
+echo "Attaching ${NBD_SERVER_VM04} to ${NBD_SERVER_NBD3}"
+attach_export "${NBD_SERVER_VM04}" "${NBD_SERVER_NBD3}"
+mount "${NBD_SERVER_NBD3}" "${VM04_MOUNT}"
+verify_tree_manifest "${VM04_MOUNT}" "${VM03_FULL_MD5_MANIFEST}" "${VM04_FULL_MD5_MANIFEST}" "${NBD_SERVER_VM04}"
+sync
+umount "${VM04_MOUNT}"
+nbd-client -d "${NBD_SERVER_NBD3}"
 
 echo "Integration flow completed successfully."

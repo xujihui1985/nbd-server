@@ -3,7 +3,7 @@ use nbd_server::Cli;
 use nbd_server::app::config::{Command, ServeConfig};
 use nbd_server::server::admin::serve_manager_admin;
 use nbd_server::server::manager::ExportManager;
-use nbd_server::storage::build_object_store;
+use nbd_server::storage::{build_object_store, build_volume_repository};
 
 #[tokio::main]
 async fn main() -> nbd_server::Result<()> {
@@ -18,7 +18,8 @@ async fn main() -> nbd_server::Result<()> {
         Command::Serve(args) => ServeConfig::from(args),
     };
     let remote = build_object_store(&serve.storage).await?;
-    let manager = ExportManager::new(serve.clone(), remote).await?;
+    let repository = build_volume_repository(serve.export_root.clone(), remote.clone());
+    let manager = ExportManager::new(serve.clone(), remote, repository).await?;
     let admin_socket = serve.admin_sock.clone();
     let nbd_addr = serve.listen;
     let admin_manager = manager.clone();

@@ -1,14 +1,8 @@
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub struct StorageNamespace {
-    pub prefix: String,
-    pub volume_key: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct CloneSource {
-    pub prefix: String,
+    pub export_id: String,
     pub snapshot_id: Option<String>,
 }
 
@@ -20,5 +14,4 @@ pub struct ExportSpec {
     pub snapshot_id: Option<String>,
     pub image_size: Option<u64>,
     pub clone_source: Option<CloneSource>,
-    pub storage: StorageNamespace,
 }
