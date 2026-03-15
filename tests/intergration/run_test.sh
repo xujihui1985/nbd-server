@@ -98,20 +98,41 @@ admin_curl() {
   local method="$1"
   local path="$2"
   local body="${3:-}"
+  local response_body
+  local http_code
+
+  response_body="$(mktemp)"
 
   if [[ -n "${body}" ]]; then
-    curl --fail --silent --show-error \
-      --unix-socket "${NBD_SERVER_ADMIN_SOCK}" \
-      -X "${method}" \
-      -H 'content-type: application/json' \
-      -d "${body}" \
-      "http://localhost${path}"
+    http_code="$(
+      curl --silent --show-error \
+        --output "${response_body}" \
+        --write-out '%{http_code}' \
+        --unix-socket "${NBD_SERVER_ADMIN_SOCK}" \
+        -X "${method}" \
+        -H 'content-type: application/json' \
+        -d "${body}" \
+        "http://localhost${path}"
+    )"
   else
-    curl --fail --silent --show-error \
-      --unix-socket "${NBD_SERVER_ADMIN_SOCK}" \
-      -X "${method}" \
-      "http://localhost${path}"
+    http_code="$(
+      curl --silent --show-error \
+        --output "${response_body}" \
+        --write-out '%{http_code}' \
+        --unix-socket "${NBD_SERVER_ADMIN_SOCK}" \
+        -X "${method}" \
+        "http://localhost${path}"
+    )"
   fi
+
+  if [[ "${http_code}" -ge 400 ]]; then
+    cat "${response_body}" >&2
+    rm -f "${response_body}"
+    return 22
+  fi
+
+  cat "${response_body}"
+  rm -f "${response_body}"
 }
 
 wait_for_admin() {
