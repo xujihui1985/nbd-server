@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::cache::LocalCache;
-use crate::config::{CloneSourceConfig, ServerConfig};
-use crate::error::{Error, Result};
-use crate::journal::{JournalOperation, JournalRecord};
-use crate::manifest::{
+use crate::core::cache::local_cache::LocalCache;
+use crate::core::engine::spec::{CloneSource, ExportSpec};
+use crate::core::error::{Error, Result};
+use crate::core::model::journal::{JournalOperation, JournalRecord};
+use crate::core::model::manifest::{
     ChunkLocation, ChunkSource, Manifest, ReplacementChunk, chunk_len, chunk_offset,
 };
-use crate::remote::StorageBackend;
-use crate::volume::VolumeMetadata;
+use crate::core::model::volume::VolumeMetadata;
+use crate::core::storage::object_store::ObjectStore;
 
 #[derive(Clone)]
 enum ReadSource {
@@ -115,9 +115,9 @@ struct PreparedPublish {
 const SINGLE_PUT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 pub struct Export {
-    config: ServerConfig,
+    config: ExportSpec,
     cache: Arc<LocalCache>,
-    remote: Arc<dyn StorageBackend>,
+    remote: Arc<dyn ObjectStore>,
     read_source: RwLock<Arc<ReadSource>>,
     published_manifest: RwLock<Option<Manifest>>,
     write_gate: RwLock<()>,
@@ -130,9 +130,10 @@ pub struct Export {
 
 impl Export {
     pub async fn create(
-        config: ServerConfig,
-        remote: Arc<dyn StorageBackend>,
+        config: impl Into<ExportSpec>,
+        remote: Arc<dyn ObjectStore>,
     ) -> Result<Arc<Self>> {
+        let config = config.into();
         if config.snapshot_id.is_some() {
             return Err(Error::InvalidRequest(
                 "--snapshot-id is only valid with the open command".to_string(),
@@ -185,7 +186,11 @@ impl Export {
         }))
     }
 
-    pub async fn open(config: ServerConfig, remote: Arc<dyn StorageBackend>) -> Result<Arc<Self>> {
+    pub async fn open(
+        config: impl Into<ExportSpec>,
+        remote: Arc<dyn ObjectStore>,
+    ) -> Result<Arc<Self>> {
+        let config = config.into();
         if config.clone_source.is_some() {
             return Err(Error::InvalidRequest(
                 "clone source is only valid with the clone command".to_string(),
@@ -228,9 +233,10 @@ impl Export {
     }
 
     pub async fn clone_from_snapshot(
-        config: ServerConfig,
-        remote: Arc<dyn StorageBackend>,
+        config: impl Into<ExportSpec>,
+        remote: Arc<dyn ObjectStore>,
     ) -> Result<Arc<Self>> {
+        let config = config.into();
         if config.snapshot_id.is_some() {
             return Err(Error::InvalidRequest(
                 "--snapshot-id is only valid with the open command".to_string(),
@@ -837,7 +843,7 @@ impl Export {
 
     async fn commit_prepared_publish(&self, prepared: PreparedPublish) -> Result<SnapshotResponse> {
         let manifest_key = manifest_key(&self.config.storage.prefix, &prepared.snapshot_id);
-        if let Some(volume_key) = &self.config.volume_key {
+        if let Some(volume_key) = &self.config.storage.volume_key {
             let stored = self.remote.get_object_with_etag(volume_key).await?;
             let current: VolumeMetadata = serde_json::from_slice(&stored.body)?;
             current.validate()?;
@@ -977,7 +983,7 @@ impl CloneSeedRecord {
 }
 
 async fn resolve_manifest(
-    remote: &dyn StorageBackend,
+    remote: &dyn ObjectStore,
     prefix: &str,
     snapshot_id: Option<String>,
 ) -> Result<ResolvedManifest> {
@@ -992,8 +998,8 @@ async fn resolve_manifest(
 }
 
 async fn resolve_manifest_for_clone(
-    remote: &dyn StorageBackend,
-    clone_source: &CloneSourceConfig,
+    remote: &dyn ObjectStore,
+    clone_source: &CloneSource,
 ) -> Result<ResolvedManifest> {
     resolve_manifest(
         remote,
@@ -1004,7 +1010,7 @@ async fn resolve_manifest_for_clone(
 }
 
 async fn resolve_manifest_by_key(
-    remote: &dyn StorageBackend,
+    remote: &dyn ObjectStore,
     manifest_key: &str,
 ) -> Result<ResolvedManifest> {
     let manifest: Manifest = serde_json::from_slice(&remote.get_object(manifest_key).await?)?;
@@ -1037,9 +1043,9 @@ mod tests {
     use bytes::Bytes;
     use tempfile::tempdir;
 
-    use crate::config::ServerConfig;
-    use crate::journal::{JournalOperation, JournalRecord};
-    use crate::remote::StorageBackend;
+    use crate::core::engine::spec::{CloneSource, ExportSpec, StorageNamespace};
+    use crate::core::model::journal::{JournalOperation, JournalRecord};
+    use crate::core::storage::object_store::{ObjectStore, StoredObject};
 
     use super::Export;
 
@@ -1056,7 +1062,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl StorageBackend for MemoryRemote {
+    impl ObjectStore for MemoryRemote {
         async fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::Result<Bytes> {
             let objects = self.objects.lock().unwrap();
             let bytes = &objects.get(key).unwrap().body;
@@ -1069,13 +1075,10 @@ mod tests {
             Ok(self.get_object_with_etag(key).await?.body)
         }
 
-        async fn get_object_with_etag(
-            &self,
-            key: &str,
-        ) -> crate::Result<crate::remote::StoredObject> {
+        async fn get_object_with_etag(&self, key: &str) -> crate::Result<StoredObject> {
             let objects = self.objects.lock().unwrap();
             let object = objects.get(key).unwrap();
-            Ok(crate::remote::StoredObject {
+            Ok(StoredObject {
                 body: Bytes::copy_from_slice(&object.body),
                 etag: Some(object.etag.clone()),
             })
@@ -1165,50 +1168,36 @@ mod tests {
         }
     }
 
-    fn base_config(dir: &Path) -> ServerConfig {
-        ServerConfig {
+    fn base_config(dir: &Path) -> ExportSpec {
+        ExportSpec {
             export_id: "export".to_string(),
             cache_dir: dir.join("cache"),
-            storage: crate::config::StorageConfig {
-                backend: crate::config::StorageBackendKind::S3,
-                bucket: "bucket".to_string(),
+            storage: StorageNamespace {
                 prefix: "exports/export".to_string(),
-                region: "us-east-1".to_string(),
-                endpoint_url: None,
-                r2_account_id: None,
+                volume_key: None,
             },
-            listen: "127.0.0.1:10809".parse().unwrap(),
-            admin_sock: dir.join("admin.sock"),
             chunk_size: 4,
             snapshot_id: None,
             image_size: Some(8),
             clone_source: None,
-            volume_key: None,
         }
     }
 
-    fn clone_config(dir: &Path) -> ServerConfig {
-        ServerConfig {
+    fn clone_config(dir: &Path) -> ExportSpec {
+        ExportSpec {
             export_id: "clone".to_string(),
             cache_dir: dir.join("clone-cache"),
-            storage: crate::config::StorageConfig {
-                backend: crate::config::StorageBackendKind::S3,
-                bucket: "bucket".to_string(),
+            storage: StorageNamespace {
                 prefix: "exports/clone".to_string(),
-                region: "us-east-1".to_string(),
-                endpoint_url: None,
-                r2_account_id: None,
+                volume_key: None,
             },
-            listen: "127.0.0.1:10810".parse().unwrap(),
-            admin_sock: dir.join("clone-admin.sock"),
             chunk_size: 4,
             snapshot_id: None,
             image_size: None,
-            clone_source: Some(crate::config::CloneSourceConfig {
+            clone_source: Some(CloneSource {
                 prefix: "exports/export".to_string(),
                 snapshot_id: Some("2".to_string()),
             }),
-            volume_key: None,
         }
     }
 

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::error::{Error, Result};
+use crate::core::error::{Error, Result};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefEntry {
@@ -97,12 +97,13 @@ impl Manifest {
         let refs: BTreeMap<u32, &RefEntry> =
             self.refs.iter().map(|entry| (entry.id, entry)).collect();
         if let Some(base_ref) = self.base_ref
-            && !refs.contains_key(&base_ref) {
-                return Err(Error::InvalidManifest(format!(
-                    "base_ref {} missing from refs",
-                    base_ref
-                )));
-            }
+            && !refs.contains_key(&base_ref)
+        {
+            return Err(Error::InvalidManifest(format!(
+                "base_ref {} missing from refs",
+                base_ref
+            )));
+        }
 
         let mut last_index = None;
         for entry in &self.entries {
@@ -113,12 +114,13 @@ impl Manifest {
                 )));
             }
             if let Some(previous) = last_index
-                && entry.index <= previous {
-                    return Err(Error::InvalidManifest(format!(
-                        "entries not strictly ordered: {} after {}",
-                        entry.index, previous
-                    )));
-                }
+                && entry.index <= previous
+            {
+                return Err(Error::InvalidManifest(format!(
+                    "entries not strictly ordered: {} after {}",
+                    entry.index, previous
+                )));
+            }
             last_index = Some(entry.index);
 
             if !refs.contains_key(&entry.ref_id) {

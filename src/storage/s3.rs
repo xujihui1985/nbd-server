@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
@@ -9,30 +8,12 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_types::region::Region;
 use bytes::Bytes;
 
-use crate::config::{StorageBackendKind, StorageConfig};
-use crate::error::{Error, Result};
-
-#[derive(Debug, Clone)]
-pub struct StoredObject {
-    pub body: Bytes,
-    pub etag: Option<String>,
-}
-
-#[async_trait]
-pub trait StorageBackend: Send + Sync {
-    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes>;
-    async fn get_object(&self, key: &str) -> Result<Bytes>;
-    async fn get_object_with_etag(&self, key: &str) -> Result<StoredObject>;
-    async fn put_bytes(&self, key: &str, body: Bytes) -> Result<()>;
-    async fn put_bytes_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<bool>;
-    async fn put_bytes_if_absent(&self, key: &str, body: Bytes) -> Result<bool>;
-    async fn put_file(&self, key: &str, path: &Path) -> Result<()>;
-    async fn delete_object(&self, key: &str) -> Result<()>;
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
-}
+use crate::app::config::StorageConfig;
+use crate::core::error::{Error, Result};
+use crate::core::storage::object_store::{ObjectStore, StoredObject};
 
 #[derive(Clone)]
-pub struct S3CompatibleStorageBackend {
+pub struct S3ObjectStore {
     backend_name: &'static str,
     bucket: String,
     region: String,
@@ -41,7 +22,7 @@ pub struct S3CompatibleStorageBackend {
     client: Client,
 }
 
-impl S3CompatibleStorageBackend {
+impl S3ObjectStore {
     pub async fn new(
         backend_name: &'static str,
         bucket: String,
@@ -96,7 +77,7 @@ impl S3CompatibleStorageBackend {
 }
 
 #[async_trait]
-impl StorageBackend for S3CompatibleStorageBackend {
+impl ObjectStore for S3ObjectStore {
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
         if len == 0 {
             return Ok(Bytes::new());
@@ -257,35 +238,15 @@ impl StorageBackend for S3CompatibleStorageBackend {
     }
 }
 
-pub async fn build_storage_backend(config: &StorageConfig) -> Result<Arc<dyn StorageBackend>> {
-    let (endpoint_url, force_path_style, backend_name) = match config.backend {
-        StorageBackendKind::S3 => (config.endpoint_url.clone(), false, "s3"),
-        StorageBackendKind::R2 => {
-            let endpoint = match (&config.endpoint_url, &config.r2_account_id) {
-                (Some(endpoint_url), _) => endpoint_url.clone(),
-                (None, Some(account_id)) => {
-                    format!("https://{account_id}.r2.cloudflarestorage.com")
-                }
-                (None, None) => {
-                    return Err(Error::InvalidRequest(
-                        "R2 backend requires either --endpoint-url or --r2-account-id".to_string(),
-                    ));
-                }
-            };
-            (Some(endpoint), true, "r2")
-        }
-    };
-
-    Ok(Arc::new(
-        S3CompatibleStorageBackend::new(
-            backend_name,
-            config.bucket.clone(),
-            config.region.clone(),
-            endpoint_url,
-            force_path_style,
-        )
-        .await?,
-    ))
+pub async fn build_s3_object_store(config: &StorageConfig) -> Result<S3ObjectStore> {
+    S3ObjectStore::new(
+        "s3",
+        config.bucket.clone(),
+        config.region.clone(),
+        config.endpoint_url.clone(),
+        false,
+    )
+    .await
 }
 
 fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
