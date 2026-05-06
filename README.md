@@ -179,6 +179,41 @@ Example response:
 }
 ```
 
+### Manifest
+```json
+{
+  "version": 2,
+  "export_id": "disk01",
+  "generation": 1,
+  "image_size": 1073741824,
+  "chunk_size": 4194304,
+  "chunk_count": 256,
+  "created_at": "2026-04-22T02:21:14.90653456Z",
+  "refs": [
+    {
+      "id": 1,
+      "path": "exports-it/disk01/snapshots/019db2fc2f6d79429ff138ed6a987b97/delta.blob"
+    }
+  ],
+  "entries": [
+    {
+      "index": 0,
+      "ref": 1,
+      "offset": 0,
+      "len": 4194304,
+      "blake3": "c8ee7183a8bf43098e539063b8f3c1671a6744eeae924b9ca7c816313f08cc64"
+    },
+    {
+      "index": 1,
+      "ref": 1,
+      "offset": 4194304,
+      "len": 4194304,
+      "blake3": "04e52cd2da6a0e1f338b0078369130d96585c1de65057da5dd1283b12fb853e1"
+    }
+  ]
+}
+```
+
 ### Reset Cache
 
 Discard all local dirty and resident cache state for the current export. This is destructive for unsnapshotted local writes and is intended for cases where you want to abandon local changes before reopening another snapshot with the same `--cache-dir`.
